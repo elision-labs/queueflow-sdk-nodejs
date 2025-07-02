@@ -1,0 +1,50 @@
+{
+  "name": "@queueflow/sdk",
+  "version": "1.0.0",
+  "description": "Official TypeScript SDK for QueueFlow",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest",
+    "lint": "eslint src --ext .ts",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "queueflow",
+    "job-queue",
+    "distributed-queue",
+    "workflow",
+    "task-queue"
+  ],
+  "author": "QueueFlow Team",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.6.0",
+    "p-limit": "^3.1.0",
+    "p-retry": "^4.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "eslint": "^8.0.0",
+    "jest": "^29.0.0",
+    "prettier": "^3.0.0",
+    "ts-jest": "^29.0.0",
+    "typescript": "^5.0.0"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/queueflow/queueflow-sdk-node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/queueflow/queueflow-sdk-node/issues"
+  },
+  "homepage": "https://github.com/queueflow/queueflow-sdk-node#readme"
+}
