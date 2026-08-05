@@ -1,0 +1,11 @@
+# Generates the low-level core only (models + per-tag APIs + fetch runtime).
+# The ergonomic facade in src/ is hand-written on top and never regenerated.
+generatorName: typescript-fetch
+additionalProperties:
+  npmName: "@queueflow/core"
+  npmVersion: 0.1.0
+  supportsES6: true
+  withInterfaces: true
+  typescriptThreePlus: true
+  modelPropertyNaming: original
+  hideGenerationTimestamp: true

@@ -1,336 +1,194 @@
-# QueueFlow Node.js SDK
+# @queueflow/sdk
 
-The official TypeScript SDK for QueueFlow distributed job queue system.
+Ergonomic TypeScript/JavaScript client for [QueueFlow](https://queueflow.dev) — a
+PostgreSQL-native distributed job queue and workflow engine.
 
-## Installation
+- **Typed end-to-end** — request/response shapes mirror the server's OpenAPI 3.1 spec.
+- **Ergonomic** — `qf.jobs.create({ task, payload })`, a `waitFor()` poller, and a workflow builder DSL.
+- **Typed errors** — `NotFoundError`, `UnauthorizedError`, `BadRequestError`, `TimeoutError`, …
+- **Zero runtime dependencies** — uses the built-in `fetch` (Node ≥ 18), with retries and timeouts.
+- **Dual ESM + CJS**, ships its own `.d.ts`.
+
+> Built as a thin hand-written facade (`src/`) over a generated core (`core/`: models + transport
+> from the [OpenAPI spec](https://github.com/queueflow/queueflow-core/blob/main/spec/openapi.yaml)).
+> The core is regenerated and never drifts from the server; the facade adds the ergonomics codegen
+> cannot. See [Architecture](#architecture).
+
+## Install
 
 ```bash
 npm install @queueflow/sdk
-# or
-yarn add @queueflow/sdk
 ```
 
-## Quick Start
+## Quick start
 
-### TypeScript/ES6
+```ts
+import { QueueFlow, wf } from "@queueflow/sdk";
 
-```typescript
-import { QueueFlowClient } from '@queueflow/sdk';
-
-// Create client
-const client = new QueueFlowClient('http://localhost:8080', 'your-api-key');
-
-async function main() {
-  // Create a job
-  const job = await client.createJob({
-    taskName: 'process_data',
-    payload: { userId: 123, action: 'send_email' },
-    config: {
-      priority: 'high',
-      retries: 3,
-      timeout: 300000
-    }
-  });
-
-  console.log(`Job created: ${job.id}`);
-
-  // Get job status
-  const status = await client.getJob(job.id);
-  console.log(`Job status: ${status.status}`);
-}
-
-main().catch(console.error);
-```
-
-### CommonJS
-
-```javascript
-const { QueueFlowClient } = require('@queueflow/sdk');
-
-const client = new QueueFlowClient('http://localhost:8080', 'your-api-key');
-
-async function main() {
-  const job = await client.createJob({
-    taskName: 'process_data',
-    payload: { userId: 123 }
-  });
-  
-  console.log(`Job created: ${job.id}`);
-}
-
-main();
-```
-
-## Features
-
-- ✅ Full TypeScript support with type definitions
-- ✅ Promise-based async/await API
-- ✅ Create and manage jobs
-- ✅ Batch job operations
-- ✅ Job status monitoring
-- ✅ Workflow support
-- ✅ Automatic retries with exponential backoff
-- ✅ Request/response interceptors
-- ✅ AbortController support for cancellation
-
-## API Reference
-
-### Client Configuration
-
-```typescript
-import { QueueFlowClient, QueueFlowConfig } from '@queueflow/sdk';
-
-const config: QueueFlowConfig = {
-  timeout: 30000,
-  retries: 3,
-  retryDelay: 1000,
-  headers: {
-    'Custom-Header': 'value'
-  }
-};
-
-const client = new QueueFlowClient('http://localhost:8080', 'api-key', config);
-```
-
-### Jobs
-
-```typescript
-// Create a job
-const job = await client.createJob({
-  taskName: 'send_email',
-  payload: { to: 'user@example.com', subject: 'Hello' },
-  config: {
-    priority: 'high',
-    retries: 3,
-    timeout: 60000,
-    delay: 5000,
-    queue: 'emails'
-  }
+const qf = new QueueFlow({
+  baseUrl: "http://localhost:8000",
+  token: process.env.QUEUEFLOW_TOKEN ?? "dev",
 });
 
-// Get job status
-const job = await client.getJob(jobId);
-
-// Cancel job
-await client.cancelJob(jobId);
-
-// List jobs
-const jobs = await client.listJobs({
-  status: 'pending',
-  limit: 50,
-  offset: 0
-});
-```
-
-### Batches
-
-```typescript
-// Create batch
-const batch = await client.createBatch({
-  jobs: [
-    { taskName: 'task1', payload: { data: 'value1' } },
-    { taskName: 'task2', payload: { data: 'value2' } }
-  ]
+// Enqueue a job and wait for the result.
+const job = await qf.jobs.create({
+  task: "echo",
+  payload: { hello: "world" },
+  maxRetries: 3,
+  timeout: 30, // seconds
 });
 
-// Get batch status
-const batch = await client.getBatch(batchId);
-```
+const done = await qf.jobs.waitFor(job.id);
+console.log(done.status, done.result);
 
-### Workflows
-
-```typescript
-// Create workflow
-const workflow = await client.createWorkflow({
-  name: 'data_pipeline',
-  steps: [
-    {
-      name: 'extract',
-      taskName: 'extract_data',
-      payload: { source: 'database' }
-    },
-    {
-      name: 'transform',
-      taskName: 'transform_data',
-      dependsOn: ['extract'],
-      payload: { format: 'json' }
-    }
-  ]
-});
-
-// Get workflow status
-const workflow = await client.getWorkflow(workflowId);
-```
-
-## TypeScript Types
-
-```typescript
-interface Job {
-  id: string;
-  taskName: string;
-  payload: Record<string, any>;
-  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancelled';
-  createdAt: string;
-  updatedAt: string;
-  result?: Record<string, any>;
-  error?: string;
-}
-
-interface JobConfig {
-  priority?: 'low' | 'normal' | 'high' | 'critical';
-  retries?: number;
-  timeout?: number;
-  delay?: number;
-  queue?: string;
-}
-
-interface CreateJobRequest {
-  taskName: string;
-  payload: Record<string, any>;
-  config?: JobConfig;
-}
-```
-
-## Error Handling
-
-```typescript
-import { QueueFlowError, NotFoundError, ValidationError } from '@queueflow/sdk';
-
-try {
-  const job = await client.createJob({
-    taskName: 'process_data',
-    payload: { userId: 123 }
-  });
-} catch (error) {
-  if (error instanceof NotFoundError) {
-    console.error('Resource not found:', error.message);
-  } else if (error instanceof ValidationError) {
-    console.error('Validation error:', error.message);
-  } else if (error instanceof QueueFlowError) {
-    console.error('QueueFlow error:', error.message);
-  } else {
-    console.error('Unknown error:', error);
-  }
-}
-```
-
-## Request Cancellation
-
-```typescript
-// Using AbortController
-const controller = new AbortController();
-
-const jobPromise = client.createJob({
-  taskName: 'long_task',
-  payload: { data: 'value' }
-}, { signal: controller.signal });
-
-// Cancel the request after 5 seconds
-setTimeout(() => controller.abort(), 5000);
-
-try {
-  const job = await jobPromise;
-} catch (error) {
-  if (error.name === 'AbortError') {
-    console.log('Request was cancelled');
-  }
-}
-```
-
-## Interceptors
-
-```typescript
-// Request interceptor
-client.interceptors.request.use((config) => {
-  config.headers['X-Request-ID'] = generateRequestId();
-  return config;
-});
-
-// Response interceptor
-client.interceptors.response.use(
-  (response) => {
-    console.log('Request successful:', response.status);
-    return response;
-  },
-  (error) => {
-    console.error('Request failed:', error.message);
-    throw error;
-  }
+// Declare and run a DAG workflow.
+const workflow = await qf.workflows.create(
+  wf("etl")
+    .step("extract", "echo")
+    .step("transform", "echo", { after: ["extract"] })
+    .step("load", "echo", { after: ["transform"], onFailure: "halt" }),
 );
+
+const finished = await qf.workflows.waitFor(workflow.id);
+console.log(finished.status, finished.context);
 ```
 
-## Examples
+## API
 
-### Polling for Job Completion
+### Client
 
-```typescript
-async function waitForJob(jobId: string): Promise<Job> {
-  while (true) {
-    const job = await client.getJob(jobId);
-    
-    if (job.status === 'completed') {
-      return job;
-    } else if (job.status === 'failed') {
-      throw new Error(`Job failed: ${job.error}`);
-    }
-    
-    // Wait 5 seconds before polling again
-    await new Promise(resolve => setTimeout(resolve, 5000));
-  }
+```ts
+const qf = new QueueFlow({
+  baseUrl,            // required
+  token,              // required — any non-empty token on the dev server
+  timeoutMs,          // per-request timeout (default 30_000)
+  maxRetries,         // retries for idempotent calls on network/5xx (default 2)
+  headers,            // extra headers on every request
+  fetch,              // inject a custom fetch (tests, proxies)
+});
+
+await qf.health();    // GET /health
+await qf.ready();     // GET /ready
+```
+
+### Jobs — `qf.jobs`
+
+| Method | Description |
+| --- | --- |
+| `create(input)` | Enqueue a job, returns the created `Job`. |
+| `enqueue(input)` | Enqueue and return just the new job id (no follow-up fetch). |
+| `createBatch(inputs)` | Enqueue up to 1000 jobs at once. |
+| `get(id)` | Fetch a job. |
+| `list(opts?)` | List jobs (`status`, `queue`, `limit`, `offset`, `orderBy`). |
+| `cancel(id)` | Cancel a job. |
+| `waitFor(id, opts?)` | Poll until `completed` / `failed` / `cancelled`. |
+
+`input` is `{ task, payload?, priority?, maxRetries?, timeout?, queue? }`.
+
+### Workflows — `qf.workflows`
+
+| Method | Description |
+| --- | --- |
+| `create(builderOrBody)` | Create a workflow from a `wf()` builder or a raw request. |
+| `get(id)` · `list(opts?)` · `cancel(id)` | Fetch / list / cancel. |
+| `diagram(id)` | Mermaid (`graph TD`) diagram of the DAG. |
+| `waitFor(id, opts?)` | Poll until a terminal workflow state. |
+
+### Workflow builder — `wf()`
+
+```ts
+import { wf } from "@queueflow/sdk";
+
+const dag = wf("order_123")
+  .step("validate", "validate_order")
+  .step("pay", "process_payment", { after: ["validate"] })
+  .step("ship", "create_shipment", { after: ["pay"], onFailure: "continue" })
+  .context({ source: "web" });
+// .build() runs locally first: duplicate names, dangling deps, and cycles throw early.
+```
+
+### System — `qf.system`
+
+```ts
+await qf.system.stats();  // engine counters
+await qf.system.tasks();  // registered task handler names
+```
+
+### Errors
+
+All SDK errors extend `QueueFlowError`:
+
+```ts
+import { NotFoundError, ApiError } from "@queueflow/sdk";
+
+try {
+  await qf.jobs.get("missing");
+} catch (err) {
+  if (err instanceof NotFoundError) { /* 404 */ }
+  else if (err instanceof ApiError) { console.error(err.status, err.body); }
+  else throw err;
 }
 ```
 
-### Batch Processing with Progress
+`ApiError` subclasses: `BadRequestError` (400), `UnauthorizedError` (401),
+`ForbiddenError` (403), `NotFoundError` (404), `ConflictError` (409). Network/abort
+failures throw `ConnectionError`; an exhausted `waitFor` throws `TimeoutError`.
 
-```typescript
-async function processBatch(jobs: CreateJobRequest[]): Promise<void> {
-  const batch = await client.createBatch({ jobs });
-  
-  console.log(`Batch created: ${batch.id}`);
-  
-  while (true) {
-    const status = await client.getBatch(batch.id);
-    
-    const total = status.totalJobs;
-    const completed = status.completedJobs;
-    const failed = status.failedJobs;
-    
-    console.log(`Progress: ${completed}/${total} completed, ${failed} failed`);
-    
-    if (status.status === 'completed') {
-      console.log('Batch completed successfully!');
-      break;
-    } else if (status.status === 'failed') {
-      throw new Error('Batch processing failed');
-    }
-    
-    await new Promise(resolve => setTimeout(resolve, 10000));
-  }
-}
-```
+## Try it against a real server
 
-## Development
+A complete, runnable Express integration that uses this SDK lives in
+[`../queueflow-examples/nodejs/express`](../queueflow-examples/nodejs/express). With
+Docker + Rust + Node installed it brings up Postgres, the QueueFlow server, builds
+this SDK, and runs an end-to-end smoke test in one command:
 
 ```bash
-# Install dependencies
-npm install
-
-# Build the project
-npm run build
-
-# Run tests
-npm test
-
-# Run tests with coverage
-npm run test:coverage
-
-# Lint code
-npm run lint
-
-# Type checking
-npm run type-check
+cd ../queueflow-examples/nodejs/express
+make demo                 # stack up + SDK build + smoke test
+make app                  # run the example API on :3000
+make down                 # stop the server + remove the Postgres container
 ```
+
+Override ports if the defaults are taken, passing the **same** values to each
+command (`make demo PG_PORT=5440 API_PORT=8055`, then `make app API_PORT=8055`,
+`make down API_PORT=8055 PG_PORT=5440`). See that example's README for endpoint
+docs, hitting the engine directly, teardown, and troubleshooting.
+
+## Architecture
+
+This package is a thin hand-written **facade** over a **generated core**:
+
+```
+queueflow-sdk-nodejs/
+├── core/        generated from the OpenAPI spec (models, per-tag API clients, fetch runtime).
+│                Never hand-edited; regenerated with `npm run generate-core`.
+└── src/         the hand-written facade (this package's public API)
+    ├── client.ts    QueueFlow + jobs/workflows/worker/system, retries, SSE watch()
+    ├── workflow.ts  the wf() builder with local DAG validation
+    ├── errors.ts    typed error hierarchy, mapped from the core's runtime errors
+    └── json.ts      JSON input types
+```
+
+The wire types and transport come from `core/`, so they cannot drift from the server; the facade
+adds only what codegen cannot express (`waitFor`, `watch`, the worker loop, the builder, typed
+errors). Both layers are bundled together into one dual ESM + CJS package, so consumers never import
+from `core/` directly.
+
+### Development
+
+```bash
+npm run generate-core   # regenerate core/ from the spec (needs Docker)
+npm run typecheck       # tsc over the facade + core
+npm run build           # bundle to dist/ (ESM + CJS + .d.ts) via tsup
+```
+
+Regenerate `core/` whenever the server's OpenAPI spec changes, then run `typecheck` to confirm the
+facade still matches.
+
+## Requirements
+
+- Node.js ≥ 18 (for the global `fetch`).
+- A running QueueFlow server — see [queueflow-core](https://github.com/queueflow/queueflow-core).
 
 ## License
 
-MIT License
+[MIT](./LICENSE)
