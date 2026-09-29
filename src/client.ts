@@ -18,6 +18,7 @@ import { DlqApi } from "../core/src/apis/DlqApi";
 import { HealthApi } from "../core/src/apis/HealthApi";
 import { JobFromJSON } from "../core/src/models/index";
 import type {
+  BackoffStrategy,
   Job,
   JobStatus,
   JobConfigRequest,
@@ -38,6 +39,7 @@ import type {
   ReadyStatus,
 } from "../core/src/models/index";
 import {
+  AbortError,
   ApiError,
   ConnectionError,
   TimeoutError,
@@ -51,6 +53,13 @@ export interface QueueFlowOptions {
   baseUrl: string;
   /** Bearer token. Any non-empty token authenticates against the dev server. */
   token: string;
+  /**
+   * Credential for the worker-protocol routes (`qf.worker`: lease, heartbeat,
+   * complete, fail). Servers running with `--worker-token` refuse tenant
+   * tokens on those routes. Defaults to `token`, which only works in the
+   * server's development mode.
+   */
+  workerToken?: string;
   /** Per-request timeout in milliseconds (default 30_000). */
   timeoutMs?: number;
   /** Times to retry idempotent requests on network / 5xx errors (default 2). */
@@ -72,6 +81,14 @@ export interface CreateJobInput {
   timeout?: number;
   /** Override the destination queue. */
   queue?: string;
+  /** How retry delays grow between attempts (default exponential). */
+  retryBackoff?: BackoffStrategy;
+  /** Base retry delay, in seconds. */
+  retryDelaySecs?: number;
+  /** Upper bound on any computed retry delay, in seconds. */
+  retryMaxDelaySecs?: number;
+  /** Retry-delay jitter in `0..=1` (e.g. `0.1` = +/-10%). */
+  jitterFactor?: number;
   /** Makes the create idempotent per tenant (sent as `Idempotency-Key`). */
   idempotencyKey?: string;
   /** Don't run before this instant. Created immediately, invisible until then. */
@@ -86,6 +103,12 @@ export interface ListOptions {
   offset?: number;
   orderBy?: "created_at ASC" | "created_at DESC";
   includeTotal?: boolean;
+  /**
+   * Opaque keyset cursor from a previous page's `next_cursor`. When set,
+   * `offset` is ignored and listing continues where that page ended; cheaper
+   * than deep OFFSET paging.
+   */
+  cursor?: string;
 }
 
 /** Options for the `waitFor` pollers. */
@@ -113,6 +136,8 @@ class Transport {
   readonly token: string;
   readonly fetchImpl: typeof fetch;
   readonly config: Configuration;
+  /** Like `config`, but authenticated with the worker credential. */
+  readonly workerConfig: Configuration;
   private readonly timeoutMs: number;
   private readonly retries: number;
 
@@ -129,6 +154,11 @@ class Transport {
     this.config = new Configuration({
       basePath: this.baseUrl,
       accessToken: this.token,
+      fetchApi: this.fetchImpl,
+    });
+    this.workerConfig = new Configuration({
+      basePath: this.baseUrl,
+      accessToken: opts.workerToken ?? this.token,
       fetchApi: this.fetchImpl,
     });
   }
@@ -231,6 +261,7 @@ export class JobsResource {
             offset: opts.offset,
             orderBy: opts.orderBy,
             includeTotal: opts.includeTotal,
+            cursor: opts.cursor,
           },
           init,
         ),
@@ -288,7 +319,11 @@ export class JobsResource {
           } else if (line.startsWith("event:")) {
             event = line.slice(6).trim();
           } else if (line.startsWith("data:")) {
-            data.push(line.slice(5).trimStart());
+            // Per the SSE spec, strip at most ONE leading space; further
+            // whitespace is payload.
+            let value = line.slice(5);
+            if (value.startsWith(" ")) value = value.slice(1);
+            data.push(value);
           }
         }
       }
@@ -332,6 +367,7 @@ export class WorkflowsResource {
             offset: opts.offset,
             orderBy: opts.orderBy,
             includeTotal: opts.includeTotal,
+            cursor: opts.cursor,
           },
           init,
         ),
@@ -373,7 +409,8 @@ export class WorkflowsResource {
 export class WorkerResource {
   private readonly api: WorkerApi;
   constructor(private readonly t: Transport) {
-    this.api = new WorkerApi(t.config);
+    // Worker routes take the worker credential, not the tenant token.
+    this.api = new WorkerApi(t.workerConfig);
   }
 
   /** Lease up to `maxJobs` jobs, long-polling up to `waitSecs` when empty. */
@@ -447,20 +484,46 @@ export class WorkerResource {
   /**
    * Run a worker loop: lease, dispatch to `handlers` by task name, heartbeat
    * while the handler runs, and report the outcome. Resolves when `signal`
-   * aborts. Handlers should be idempotent (delivery is at-least-once).
+   * aborts; throws on 401/403 from the lease call (a wrong or missing worker
+   * token cannot heal by retrying). Handlers should be idempotent (delivery
+   * is at-least-once) and should honour `ctx.signal`, which aborts when the
+   * job's lease is lost (cancelled mid-run or reclaimed) — from then on the
+   * server owns the outcome and any further work is wasted.
    */
   async run(
     queue: string,
-    handlers: Record<string, (job: Job) => Promise<JsonObject>>,
-    opts: { leaseSecs?: number; waitSecs?: number; signal?: AbortSignal } = {},
+    handlers: Record<string, WorkerHandler>,
+    opts: {
+      leaseSecs?: number;
+      waitSecs?: number;
+      signal?: AbortSignal;
+      /** Called on transient lease errors (default: throttled console.warn). */
+      onError?: (error: Error) => void;
+    } = {},
   ): Promise<void> {
     const leaseSecs = opts.leaseSecs ?? 30;
     const waitSecs = opts.waitSecs ?? 20;
+    let failures = 0;
     while (!opts.signal?.aborted) {
       let leases: LeasedJob[];
       try {
         leases = await this.lease(queue, { maxJobs: 1, leaseSecs, waitSecs });
-      } catch {
+        failures = 0;
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        // Auth errors cannot heal by retrying: surface them instead of
+        // spinning silently at 1 req/s with a bad or missing worker token.
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+          throw error;
+        }
+        failures += 1;
+        if (opts.onError) {
+          opts.onError(error);
+        } else if (failures === 1 || failures % 30 === 0) {
+          console.warn(
+            `[queueflow] worker lease failed (${failures} consecutive): ${error.message}`,
+          );
+        }
         await sleep(1_000, opts.signal);
         continue;
       }
@@ -472,40 +535,66 @@ export class WorkerResource {
 
   private async runOne(
     lease: LeasedJob,
-    handlers: Record<string, (job: Job) => Promise<JsonObject>>,
+    handlers: Record<string, WorkerHandler>,
     leaseSecs: number,
   ): Promise<void> {
     const handler = handlers[lease.job.task_name];
     if (!handler) {
       await this.fail(lease, `no remote handler for task '${lease.job.task_name}'`, {
         retryable: false,
-      });
+      }).catch(() => {});
       return;
     }
     // Heartbeat at half the lease interval. A non-running status (or a 409
-    // lost-lease) means the server owns the outcome, so stop reporting.
-    let leaseLost = false;
+    // lost-lease) means the server owns the outcome: abort the handler so it
+    // can stop, and report nothing.
+    const lost = new AbortController();
     const ticker = setInterval(() => {
       void this.heartbeat(lease, leaseSecs)
         .then((status) => {
-          if (status !== "running") leaseLost = true;
+          if (status !== "running") lost.abort();
         })
         .catch((err: unknown) => {
-          if ((err as { status?: number }).status === 409) leaseLost = true;
+          if ((err as { status?: number }).status === 409) lost.abort();
         });
     }, Math.max(1, leaseSecs / 2) * 1_000);
+
+    // Handler outcome and outcome *reporting* are separate concerns: a
+    // reporting error must never be re-reported as a job failure (that would
+    // burn retry budget on a transport blip and drop a successful result).
+    let outcome: { ok: true; result: JsonObject } | { ok: false; error: string };
     try {
-      const result = await handler(lease.job);
-      if (!leaseLost) await this.complete(lease, result);
+      outcome = { ok: true, result: await handler(lease.job, { signal: lost.signal }) };
     } catch (err) {
-      if (!leaseLost) {
-        await this.fail(lease, err instanceof Error ? err.message : String(err)).catch(() => {});
-      }
+      outcome = { ok: false, error: err instanceof Error ? err.message : String(err) };
     } finally {
       clearInterval(ticker);
     }
+    if (lost.signal.aborted) return; // the server owns the outcome
+
+    const report = outcome.ok
+      ? this.complete(lease, outcome.result)
+      : this.fail(lease, outcome.error);
+    await report.catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[queueflow] failed to report job ${lease.job.id} outcome; the lease will expire and the server redelivers: ${msg}`,
+      );
+    });
   }
 }
+
+/** Per-job context handed to worker handlers. */
+export interface WorkerContext {
+  /**
+   * Aborts when the job's lease is lost (cancelled mid-run, or reclaimed
+   * after expiry). The server owns the outcome from then on; stop working.
+   */
+  signal: AbortSignal;
+}
+
+/** A worker task handler. Delivery is at-least-once: make it idempotent. */
+export type WorkerHandler = (job: Job, ctx: WorkerContext) => Promise<JsonObject>;
 
 /** Recurring enqueues on a cron schedule (UTC): create, list, pause, resume. */
 export class CronResource {
@@ -543,6 +632,7 @@ export class CronResource {
             offset: opts.offset,
             orderBy: opts.orderBy,
             includeTotal: opts.includeTotal,
+            cursor: opts.cursor,
           },
           init,
         ),
@@ -592,6 +682,7 @@ export class DlqResource {
             offset: opts.offset,
             orderBy: opts.orderBy,
             includeTotal: opts.includeTotal,
+            cursor: opts.cursor,
           },
           init,
         ),
@@ -654,10 +745,12 @@ export class QueueFlow {
   readonly cron: CronResource;
   readonly dlq: DlqResource;
   readonly system: SystemResource;
+  private readonly transport: Transport;
   private readonly health_: HealthApi;
 
   constructor(options: QueueFlowOptions) {
     const transport = new Transport(options);
+    this.transport = transport;
     this.jobs = new JobsResource(transport);
     this.workflows = new WorkflowsResource(transport);
     this.worker = new WorkerResource(transport);
@@ -667,14 +760,18 @@ export class QueueFlow {
     this.health_ = new HealthApi(transport.config);
   }
 
-  /** Liveness probe (`GET /health`). */
+  /** Liveness probe (`GET /health`). Same timeout/retry/error policy as every other call. */
   health(): Promise<HealthStatus> {
-    return this.health_.getHealth();
+    return this.transport.call("getHealth", (init) => this.health_.getHealth(init), {
+      idempotent: true,
+    });
   }
 
-  /** Readiness probe (`GET /ready`). */
+  /** Readiness probe (`GET /ready`). Same timeout/retry/error policy as every other call. */
   ready(): Promise<ReadyStatus> {
-    return this.health_.getReady();
+    return this.transport.call("getReady", (init) => this.health_.getReady(init), {
+      idempotent: true,
+    });
   }
 }
 
@@ -684,6 +781,10 @@ function toJobConfigRequest(input: CreateJobInput): JobConfigRequest | undefined
   if (input.maxRetries !== undefined) config.max_retries = input.maxRetries;
   if (input.timeout !== undefined) config.timeout = input.timeout;
   if (input.queue !== undefined) config.queue = input.queue;
+  if (input.retryBackoff !== undefined) config.retry_backoff = input.retryBackoff;
+  if (input.retryDelaySecs !== undefined) config.retry_delay_secs = input.retryDelaySecs;
+  if (input.retryMaxDelaySecs !== undefined) config.retry_max_delay_secs = input.retryMaxDelaySecs;
+  if (input.jitterFactor !== undefined) config.jitter_factor = input.jitterFactor;
   return Object.keys(config).length ? config : undefined;
 }
 
@@ -709,7 +810,7 @@ async function poll<T>(
   const intervalMs = opts.intervalMs ?? 500;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    if (opts.signal?.aborted) throw new TimeoutError(`waitFor(${kind} ${id}) aborted`, id);
+    if (opts.signal?.aborted) throw new AbortError(`waitFor(${kind} ${id}) aborted`);
     const value = await fetchOne();
     if (isTerminal(value)) return value;
     if (Date.now() + intervalMs > deadline) {

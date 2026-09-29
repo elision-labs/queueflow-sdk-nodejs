@@ -46,6 +46,14 @@ export interface ListDeadLettersResponse {
      */
     limit: number;
     /**
+     * Opaque keyset cursor for the next page (present when `has_more`).
+     * Pass it back as `cursor` to continue where this page ended; cheaper
+     * than deep OFFSET paging.
+     * @type {string}
+     * @memberof ListDeadLettersResponse
+     */
+    next_cursor?: string | null;
+    /**
      * 
      * @type {number}
      * @memberof ListDeadLettersResponse
@@ -83,6 +91,7 @@ export function ListDeadLettersResponseFromJSONTyped(json: any, ignoreDiscrimina
         'dead_letters': ((json['dead_letters'] as Array<any>).map(DeadLetterFromJSON)),
         'has_more': json['has_more'],
         'limit': json['limit'],
+        'next_cursor': json['next_cursor'] == null ? undefined : json['next_cursor'],
         'offset': json['offset'],
         'total': json['total'] == null ? undefined : json['total'],
     };
@@ -102,6 +111,7 @@ export function ListDeadLettersResponseToJSONTyped(value?: ListDeadLettersRespon
         'dead_letters': ((value['dead_letters'] as Array<any>).map(DeadLetterToJSON)),
         'has_more': value['has_more'],
         'limit': value['limit'],
+        'next_cursor': value['next_cursor'],
         'offset': value['offset'],
         'total': value['total'],
     };

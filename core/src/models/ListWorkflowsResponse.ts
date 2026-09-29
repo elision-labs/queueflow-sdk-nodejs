@@ -40,6 +40,14 @@ export interface ListWorkflowsResponse {
      */
     limit: number;
     /**
+     * Opaque keyset cursor for the next page (present when `has_more`).
+     * Pass it back as `cursor` to continue where this page ended; cheaper
+     * than deep OFFSET paging.
+     * @type {string}
+     * @memberof ListWorkflowsResponse
+     */
+    next_cursor?: string | null;
+    /**
      * 
      * @type {number}
      * @memberof ListWorkflowsResponse
@@ -82,6 +90,7 @@ export function ListWorkflowsResponseFromJSONTyped(json: any, ignoreDiscriminato
         
         'has_more': json['has_more'],
         'limit': json['limit'],
+        'next_cursor': json['next_cursor'] == null ? undefined : json['next_cursor'],
         'offset': json['offset'],
         'total': json['total'] == null ? undefined : json['total'],
         'workflows': ((json['workflows'] as Array<any>).map(WorkflowFromJSON)),
@@ -101,6 +110,7 @@ export function ListWorkflowsResponseToJSONTyped(value?: ListWorkflowsResponse |
         
         'has_more': value['has_more'],
         'limit': value['limit'],
+        'next_cursor': value['next_cursor'],
         'offset': value['offset'],
         'total': value['total'],
         'workflows': ((value['workflows'] as Array<any>).map(WorkflowToJSON)),

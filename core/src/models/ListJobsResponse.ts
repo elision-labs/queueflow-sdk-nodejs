@@ -46,6 +46,14 @@ export interface ListJobsResponse {
      */
     limit: number;
     /**
+     * Opaque keyset cursor for the next page (present when `has_more`).
+     * Pass it back as `cursor` to continue where this page ended; cheaper
+     * than deep OFFSET paging.
+     * @type {string}
+     * @memberof ListJobsResponse
+     */
+    next_cursor?: string | null;
+    /**
      * 
      * @type {number}
      * @memberof ListJobsResponse
@@ -85,6 +93,7 @@ export function ListJobsResponseFromJSONTyped(json: any, ignoreDiscriminator: bo
         'has_more': json['has_more'],
         'jobs': ((json['jobs'] as Array<any>).map(JobFromJSON)),
         'limit': json['limit'],
+        'next_cursor': json['next_cursor'] == null ? undefined : json['next_cursor'],
         'offset': json['offset'],
         'total': json['total'] == null ? undefined : json['total'],
     };
@@ -104,6 +113,7 @@ export function ListJobsResponseToJSONTyped(value?: ListJobsResponse | null, ign
         'has_more': value['has_more'],
         'jobs': ((value['jobs'] as Array<any>).map(JobToJSON)),
         'limit': value['limit'],
+        'next_cursor': value['next_cursor'],
         'offset': value['offset'],
         'total': value['total'],
     };

@@ -13,12 +13,26 @@
  */
 
 import { mapValues } from '../runtime';
+import type { BackoffStrategy } from './BackoffStrategy';
+import {
+    BackoffStrategyFromJSON,
+    BackoffStrategyFromJSONTyped,
+    BackoffStrategyToJSON,
+    BackoffStrategyToJSONTyped,
+} from './BackoffStrategy';
+
 /**
  * Optional per-job configuration overrides.
  * @export
  * @interface JobConfigRequest
  */
 export interface JobConfigRequest {
+    /**
+     * Retry-delay jitter in `0.0..=1.0` (e.g. `0.1` = +/-10%).
+     * @type {number}
+     * @memberof JobConfigRequest
+     */
+    jitter_factor?: number | null;
     /**
      * 
      * @type {number}
@@ -38,12 +52,32 @@ export interface JobConfigRequest {
      */
     queue?: string | null;
     /**
+     * How retry delays grow between attempts (default exponential).
+     * @type {BackoffStrategy}
+     * @memberof JobConfigRequest
+     */
+    retry_backoff?: BackoffStrategy | null;
+    /**
+     * Base retry delay, in seconds.
+     * @type {number}
+     * @memberof JobConfigRequest
+     */
+    retry_delay_secs?: number | null;
+    /**
+     * Upper bound on any computed retry delay, in seconds.
+     * @type {number}
+     * @memberof JobConfigRequest
+     */
+    retry_max_delay_secs?: number | null;
+    /**
      * Per-attempt timeout, in seconds.
      * @type {number}
      * @memberof JobConfigRequest
      */
     timeout?: number | null;
 }
+
+
 
 /**
  * Check if a given object implements the JobConfigRequest interface.
@@ -62,9 +96,13 @@ export function JobConfigRequestFromJSONTyped(json: any, ignoreDiscriminator: bo
     }
     return {
         
+        'jitter_factor': json['jitter_factor'] == null ? undefined : json['jitter_factor'],
         'max_retries': json['max_retries'] == null ? undefined : json['max_retries'],
         'priority': json['priority'] == null ? undefined : json['priority'],
         'queue': json['queue'] == null ? undefined : json['queue'],
+        'retry_backoff': json['retry_backoff'] == null ? undefined : BackoffStrategyFromJSON(json['retry_backoff']),
+        'retry_delay_secs': json['retry_delay_secs'] == null ? undefined : json['retry_delay_secs'],
+        'retry_max_delay_secs': json['retry_max_delay_secs'] == null ? undefined : json['retry_max_delay_secs'],
         'timeout': json['timeout'] == null ? undefined : json['timeout'],
     };
 }
@@ -80,9 +118,13 @@ export function JobConfigRequestToJSONTyped(value?: JobConfigRequest | null, ign
 
     return {
         
+        'jitter_factor': value['jitter_factor'],
         'max_retries': value['max_retries'],
         'priority': value['priority'],
         'queue': value['queue'],
+        'retry_backoff': BackoffStrategyToJSON(value['retry_backoff']),
+        'retry_delay_secs': value['retry_delay_secs'],
+        'retry_max_delay_secs': value['retry_max_delay_secs'],
         'timeout': value['timeout'],
     };
 }

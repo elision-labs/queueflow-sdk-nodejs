@@ -61,9 +61,9 @@ console.log(finished.status, finished.context);
 const qf = new QueueFlow({
   baseUrl,            // required
   token,              // required — any non-empty token on the dev server
+  workerToken,        // credential for qf.worker routes (defaults to token; dev mode only)
   timeoutMs,          // per-request timeout (default 30_000)
   maxRetries,         // retries for idempotent calls on network/5xx (default 2)
-  headers,            // extra headers on every request
   fetch,              // inject a custom fetch (tests, proxies)
 });
 
@@ -79,11 +79,16 @@ await qf.ready();     // GET /ready
 | `enqueue(input)` | Enqueue and return just the new job id (no follow-up fetch). |
 | `createBatch(inputs)` | Enqueue up to 1000 jobs at once. |
 | `get(id)` | Fetch a job. |
-| `list(opts?)` | List jobs (`status`, `queue`, `limit`, `offset`, `orderBy`). |
+| `list(opts?)` | List jobs (`status`, `queue`, `limit`, `offset`, `orderBy`, `cursor`). |
 | `cancel(id)` | Cancel a job. |
 | `waitFor(id, opts?)` | Poll until `completed` / `failed` / `cancelled`. |
+| `watch(id, opts?)` | Async-iterate the job's status changes (SSE); ends at a terminal state. |
 
-`input` is `{ task, payload?, priority?, maxRetries?, timeout?, queue? }`.
+`input` is `{ task, payload?, priority?, maxRetries?, timeout?, queue?, retryBackoff?,
+retryDelaySecs?, retryMaxDelaySecs?, jitterFactor?, idempotencyKey?, runAt? }`.
+
+List responses carry `next_cursor` when there are more pages; pass it back as
+`cursor` for keyset pagination (cheaper than deep `offset`).
 
 ### Workflows — `qf.workflows`
 
@@ -114,6 +119,42 @@ await qf.system.stats();  // engine counters
 await qf.system.tasks();  // registered task handler names
 ```
 
+### Worker — `qf.worker`
+
+Run task handlers in this process against a remote QueueFlow server:
+
+```ts
+await qf.worker.run("default", {
+  "send-email": async (job, ctx) => {
+    // ctx.signal aborts if the job is cancelled mid-run or the lease is lost.
+    await sendEmail(job.payload);
+    return { sent: true };
+  },
+});
+```
+
+`run()` leases one job at a time, heartbeats at half the lease interval, stops
+reporting when the lease is lost, and applies the server's retry policy on
+errors. Delivery is at-least-once — make handlers idempotent. Configure the
+server's `--worker-token` and pass it as `workerToken`; `run()` throws on
+401/403 rather than spinning. Lower-level calls (`lease`, `heartbeat`,
+`complete`, `fail`) are also exposed.
+
+### Cron — `qf.cron`
+
+| Method | Description |
+| --- | --- |
+| `create({ name, schedule, task, payload?, queue? })` | Register a recurring enqueue (5-field crontab, UTC). |
+| `get(id)` · `list(opts?)` · `delete(id)` | Fetch / list / delete. |
+| `pause(id)` · `resume(id)` | Stop firings / resume at the next future occurrence. |
+
+### Dead letters — `qf.dlq`
+
+| Method | Description |
+| --- | --- |
+| `list(opts?)` · `get(id)` | Inspect terminally-failed jobs. |
+| `replay(id)` | Re-run one as a fresh job (at most once; a second replay is a 409). |
+
 ### Errors
 
 All SDK errors extend `QueueFlowError`:
@@ -132,17 +173,18 @@ try {
 
 `ApiError` subclasses: `BadRequestError` (400), `UnauthorizedError` (401),
 `ForbiddenError` (403), `NotFoundError` (404), `ConflictError` (409). Network/abort
-failures throw `ConnectionError`; an exhausted `waitFor` throws `TimeoutError`.
+failures throw `ConnectionError`; an exhausted `waitFor` throws `TimeoutError`, and a
+caller-aborted one throws `AbortError`.
 
 ## Try it against a real server
 
 A complete, runnable Express integration that uses this SDK lives in
-[`../queueflow-examples/nodejs/express`](../queueflow-examples/nodejs/express). With
+[`../queueflow-nodejs-example`](../queueflow-nodejs-example). With
 Docker + Rust + Node installed it brings up Postgres, the QueueFlow server, builds
 this SDK, and runs an end-to-end smoke test in one command:
 
 ```bash
-cd ../queueflow-examples/nodejs/express
+cd ../queueflow-nodejs-example
 make demo                 # stack up + SDK build + smoke test
 make app                  # run the example API on :3000
 make down                 # stop the server + remove the Postgres container

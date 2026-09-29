@@ -23,6 +23,15 @@ import {
 
 /**
  * Per-job execution configuration. All durations are in seconds.
+ * 
+ * Deserialization is partial-friendly: any omitted field takes its
+ * [`JobConfig::default`] value (via per-field serde defaults), so
+ * workflow-step and cron config overrides can name just the fields they
+ * change, and out-of-band rows with sparse `config` JSONB still load.
+ * Per-field functions rather than a struct-level `#[serde(default)]`:
+ * the struct-level form makes utoipa attach a `default` beside the
+ * `BackoffStrategy` `$ref`, which forces a synthetic wrapper type into
+ * every generated SDK.
  * @export
  * @interface JobConfig
  */
@@ -39,14 +48,14 @@ export interface JobConfig {
      * @type {number}
      * @memberof JobConfig
      */
-    max_retries: number;
+    max_retries?: number;
     /**
      * Higher is claimed first within a queue; ties break on `scheduled_at`,
      * then `created_at`.
      * @type {number}
      * @memberof JobConfig
      */
-    priority: number;
+    priority?: number;
     /**
      * 
      * @type {BackoffStrategy}
@@ -58,19 +67,19 @@ export interface JobConfig {
      * @type {number}
      * @memberof JobConfig
      */
-    retry_delay_secs: number;
+    retry_delay_secs?: number;
     /**
      * 
      * @type {number}
      * @memberof JobConfig
      */
-    retry_max_delay_secs: number;
+    retry_max_delay_secs?: number;
     /**
      * 
      * @type {number}
      * @memberof JobConfig
      */
-    timeout_secs: number;
+    timeout_secs?: number;
 }
 
 
@@ -79,11 +88,6 @@ export interface JobConfig {
  * Check if a given object implements the JobConfig interface.
  */
 export function instanceOfJobConfig(value: object): value is JobConfig {
-    if (!('max_retries' in value) || value['max_retries'] === undefined) return false;
-    if (!('priority' in value) || value['priority'] === undefined) return false;
-    if (!('retry_delay_secs' in value) || value['retry_delay_secs'] === undefined) return false;
-    if (!('retry_max_delay_secs' in value) || value['retry_max_delay_secs'] === undefined) return false;
-    if (!('timeout_secs' in value) || value['timeout_secs'] === undefined) return false;
     return true;
 }
 
@@ -98,12 +102,12 @@ export function JobConfigFromJSONTyped(json: any, ignoreDiscriminator: boolean):
     return {
         
         'jitter_factor': json['jitter_factor'] == null ? undefined : json['jitter_factor'],
-        'max_retries': json['max_retries'],
-        'priority': json['priority'],
+        'max_retries': json['max_retries'] == null ? undefined : json['max_retries'],
+        'priority': json['priority'] == null ? undefined : json['priority'],
         'retry_backoff': json['retry_backoff'] == null ? undefined : BackoffStrategyFromJSON(json['retry_backoff']),
-        'retry_delay_secs': json['retry_delay_secs'],
-        'retry_max_delay_secs': json['retry_max_delay_secs'],
-        'timeout_secs': json['timeout_secs'],
+        'retry_delay_secs': json['retry_delay_secs'] == null ? undefined : json['retry_delay_secs'],
+        'retry_max_delay_secs': json['retry_max_delay_secs'] == null ? undefined : json['retry_max_delay_secs'],
+        'timeout_secs': json['timeout_secs'] == null ? undefined : json['timeout_secs'],
     };
 }
 

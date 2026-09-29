@@ -24,6 +24,8 @@ export type {
   CreateCronInput,
   ListOptions,
   WaitOptions,
+  WorkerContext,
+  WorkerHandler,
 } from "./client";
 
 export { wf, WorkflowBuilder, WorkflowValidationError } from "./workflow";
@@ -39,6 +41,7 @@ export {
   ConflictError,
   ConnectionError,
   TimeoutError,
+  AbortError,
 } from "./errors";
 
 export type { Json, JsonObject } from "./json";

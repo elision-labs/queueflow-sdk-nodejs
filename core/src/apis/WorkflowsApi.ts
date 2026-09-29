@@ -60,6 +60,7 @@ export interface ListWorkflowsRequest {
     offset?: number;
     orderBy?: string;
     includeTotal?: boolean;
+    cursor?: string;
 }
 
 /**
@@ -129,6 +130,7 @@ export interface WorkflowsApiInterface {
      * @param {number} [offset] Number of records to skip (default 0).
      * @param {string} [orderBy] &#x60;created_at ASC&#x60; or &#x60;created_at DESC&#x60; (default DESC).
      * @param {boolean} [includeTotal] Include the exact &#x60;total&#x60; count in the response (default false; the count is an extra full scan over the filtered set).
+     * @param {string} [cursor] Opaque keyset cursor from a previous page\&#39;s &#x60;next_cursor&#x60;. When set, &#x60;offset&#x60; is ignored and listing continues where that page ended.
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      * @memberof WorkflowsApiInterface
@@ -331,6 +333,10 @@ export class WorkflowsApi extends runtime.BaseAPI implements WorkflowsApiInterfa
 
         if (requestParameters['includeTotal'] != null) {
             queryParameters['include_total'] = requestParameters['includeTotal'];
+        }
+
+        if (requestParameters['cursor'] != null) {
+            queryParameters['cursor'] = requestParameters['cursor'];
         }
 
         const headerParameters: runtime.HTTPHeaders = {};

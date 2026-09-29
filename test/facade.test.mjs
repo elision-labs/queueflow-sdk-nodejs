@@ -20,6 +20,7 @@ import {
   ApiError,
   NotFoundError,
   TimeoutError,
+  AbortError,
 } from "../dist/index.js";
 
 // --- helpers ---------------------------------------------------------------
@@ -243,7 +244,7 @@ test("jobs.waitFor honours an already-aborted signal without fetching", async ()
 
   await assert.rejects(
     () => qf.jobs.waitFor("job-1", { signal: AbortSignal.abort(), intervalMs: 1 }),
-    TimeoutError,
+    AbortError,
   );
   assert.equal(calls.length, 0, "an aborted wait must not issue a request");
 });

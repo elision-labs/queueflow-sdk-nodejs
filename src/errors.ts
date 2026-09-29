@@ -98,6 +98,14 @@ export class TimeoutError extends QueueFlowError {
   }
 }
 
+/** The caller's `AbortSignal` cancelled the operation (e.g. a `waitFor`). */
+export class AbortError extends QueueFlowError {
+  constructor(message: string) {
+    super(message);
+    this.name = "AbortError";
+  }
+}
+
 /** Map an HTTP status to the most specific error subclass. */
 function errorForStatus(args: ConstructorParameters<typeof ApiError>[0]): ApiError {
   switch (args.status) {
