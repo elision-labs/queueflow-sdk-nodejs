@@ -42,6 +42,7 @@ export {
   ConnectionError,
   TimeoutError,
   AbortError,
+  NonRetryableError,
 } from "./errors";
 
 export type { Json, JsonObject } from "./json";
@@ -49,6 +50,7 @@ export type { Json, JsonObject } from "./json";
 // Wire types come straight from the generated core — single source of truth.
 export type {
   Job,
+  WorkflowStepState,
   JobConfig,
   JobStatus,
   BackoffStrategy,

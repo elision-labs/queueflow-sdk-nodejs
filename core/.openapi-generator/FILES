@@ -45,11 +45,14 @@ src/models/OnSuccess.ts
 src/models/ReadyStatus.ts
 src/models/ReplayDeadLetterResponse.ts
 src/models/StatsSnapshot.ts
+src/models/StepStatus.ts
 src/models/TasksResponse.ts
 src/models/Workflow.ts
 src/models/WorkflowDiagramResponse.ts
 src/models/WorkflowStatus.ts
 src/models/WorkflowStep.ts
+src/models/WorkflowStepState.ts
+src/models/WorkflowStepStatesResponse.ts
 src/models/index.ts
 src/runtime.ts
 tsconfig.esm.json

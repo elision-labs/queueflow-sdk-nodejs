@@ -29,6 +29,7 @@ import type {
   ListWorkflowsResponse,
   CreateWorkflowRequest,
   WorkflowDiagramResponse,
+  WorkflowStepState,
   LeasedJob,
   StatsSnapshot,
   CronSchedule,
@@ -388,6 +389,20 @@ export class WorkflowsResource {
     );
   }
 
+  /**
+   * Runtime status of every step, in declaration order — the live progress
+   * view (`get()` returns the step *definitions* only). Each entry carries
+   * the step's status and, once scheduled, the id of the job executing it.
+   */
+  async steps(id: string): Promise<WorkflowStepState[]> {
+    const res = await this.t.call(
+      "getWorkflowStepStates",
+      (init) => this.api.getWorkflowStepStates({ id }, init),
+      { idempotent: true },
+    );
+    return res.steps;
+  }
+
   /** Poll until the workflow reaches a terminal state. */
   waitFor(id: string, opts: WaitOptions = {}): Promise<Workflow> {
     return poll(
@@ -562,11 +577,19 @@ export class WorkerResource {
     // Handler outcome and outcome *reporting* are separate concerns: a
     // reporting error must never be re-reported as a job failure (that would
     // burn retry budget on a transport blip and drop a successful result).
-    let outcome: { ok: true; result: JsonObject } | { ok: false; error: string };
+    let outcome:
+      | { ok: true; result: JsonObject }
+      | { ok: false; error: string; retryable: boolean };
     try {
       outcome = { ok: true, result: await handler(lease.job, { signal: lost.signal }) };
     } catch (err) {
-      outcome = { ok: false, error: err instanceof Error ? err.message : String(err) };
+      outcome = {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+        // NonRetryableError (or any error carrying `retryable: false`) sends
+        // the job straight to the dead-letter queue.
+        retryable: (err as { retryable?: boolean } | null)?.retryable !== false,
+      };
     } finally {
       clearInterval(ticker);
     }
@@ -574,7 +597,7 @@ export class WorkerResource {
 
     const report = outcome.ok
       ? this.complete(lease, outcome.result)
-      : this.fail(lease, outcome.error);
+      : this.fail(lease, outcome.error, { retryable: outcome.retryable });
     await report.catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
       console.warn(

@@ -106,6 +106,20 @@ export class AbortError extends QueueFlowError {
   }
 }
 
+/**
+ * Throw from a worker handler to mark the failure PERMANENT: the job skips
+ * its remaining retries and dead-letters immediately (e.g. invalid input,
+ * a fraud rejection). Any thrown error with `retryable === false` works the
+ * same; this class is the convenient spelling.
+ */
+export class NonRetryableError extends QueueFlowError {
+  readonly retryable = false;
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = "NonRetryableError";
+  }
+}
+
 /** Map an HTTP status to the most specific error subclass. */
 function errorForStatus(args: ConstructorParameters<typeof ApiError>[0]): ApiError {
   switch (args.status) {
