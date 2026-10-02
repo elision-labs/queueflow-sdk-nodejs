@@ -1,7 +1,7 @@
 {
   "name": "@queueflow/sdk",
   "version": "0.1.0",
-  "description": "Ergonomic TypeScript/JavaScript client for QueueFlow — a PostgreSQL-native distributed job queue and workflow engine.",
+  "description": "Ergonomic TypeScript/JavaScript client for QueueFlow \u2014 a PostgreSQL-native distributed job queue and workflow engine.",
   "license": "MIT",
   "homepage": "https://queueflow.dev",
   "repository": {
@@ -46,5 +46,8 @@
   "devDependencies": {
     "tsup": "^8.3.0",
     "typescript": "^5.4.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

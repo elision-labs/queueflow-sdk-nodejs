@@ -65,6 +65,8 @@ export interface ListJobsRequest {
     orderBy?: string;
     includeTotal?: boolean;
     cursor?: string;
+    createdAfter?: Date;
+    createdBefore?: Date;
 }
 
 export interface StreamJobEventsRequest {
@@ -140,6 +142,8 @@ export interface JobsApiInterface {
      * @param {string} [orderBy] &#x60;created_at ASC&#x60; or &#x60;created_at DESC&#x60; (default DESC).
      * @param {boolean} [includeTotal] Include the exact &#x60;total&#x60; count in the response (default false; the count is an extra full scan over the filtered set).
      * @param {string} [cursor] Opaque keyset cursor from a previous page\&#39;s &#x60;next_cursor&#x60;. When set, &#x60;offset&#x60; is ignored and listing continues where that page ended.
+     * @param {Date} [createdAfter] Only rows created at or after this instant (RFC 3339, inclusive). With &#x60;created_before&#x60; this forms the half-open range &#x60;[after, before)&#x60; — the natural shape for walking history period by period.
+     * @param {Date} [createdBefore] Only rows created strictly before this instant (RFC 3339, exclusive).
      * @param {*} [options] Override http request option.
      * @throws {RequiredError}
      * @memberof JobsApiInterface
@@ -368,6 +372,14 @@ export class JobsApi extends runtime.BaseAPI implements JobsApiInterface {
 
         if (requestParameters['cursor'] != null) {
             queryParameters['cursor'] = requestParameters['cursor'];
+        }
+
+        if (requestParameters['createdAfter'] != null) {
+            queryParameters['created_after'] = (requestParameters['createdAfter'] as any).toISOString();
+        }
+
+        if (requestParameters['createdBefore'] != null) {
+            queryParameters['created_before'] = (requestParameters['createdBefore'] as any).toISOString();
         }
 
         const headerParameters: runtime.HTTPHeaders = {};

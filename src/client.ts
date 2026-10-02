@@ -110,6 +110,14 @@ export interface ListOptions {
    * than deep OFFSET paging.
    */
   cursor?: string;
+  /** Only rows created at or after this instant (inclusive). */
+  createdAfter?: Date | string;
+  /** Only rows created strictly before this instant (exclusive). */
+  createdBefore?: Date | string;
+}
+
+function toDate(v: Date | string | undefined): Date | undefined {
+  return v === undefined ? undefined : v instanceof Date ? v : new Date(v);
 }
 
 /** Options for the `waitFor` pollers. */
@@ -263,6 +271,8 @@ export class JobsResource {
             orderBy: opts.orderBy,
             includeTotal: opts.includeTotal,
             cursor: opts.cursor,
+            createdAfter: toDate(opts.createdAfter),
+            createdBefore: toDate(opts.createdBefore),
           },
           init,
         ),
@@ -369,6 +379,8 @@ export class WorkflowsResource {
             orderBy: opts.orderBy,
             includeTotal: opts.includeTotal,
             cursor: opts.cursor,
+            createdAfter: toDate(opts.createdAfter),
+            createdBefore: toDate(opts.createdBefore),
           },
           init,
         ),
@@ -656,6 +668,8 @@ export class CronResource {
             orderBy: opts.orderBy,
             includeTotal: opts.includeTotal,
             cursor: opts.cursor,
+            createdAfter: toDate(opts.createdAfter),
+            createdBefore: toDate(opts.createdBefore),
           },
           init,
         ),
@@ -706,6 +720,8 @@ export class DlqResource {
             orderBy: opts.orderBy,
             includeTotal: opts.includeTotal,
             cursor: opts.cursor,
+            createdAfter: toDate(opts.createdAfter),
+            createdBefore: toDate(opts.createdBefore),
           },
           init,
         ),

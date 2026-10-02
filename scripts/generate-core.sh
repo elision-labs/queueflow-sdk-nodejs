@@ -23,6 +23,12 @@ if [[ ! -f "${SPEC}" ]]; then
   exit 1
 fi
 
+# A dead docker daemon after the wipe would leave core/ gutted: check first.
+if ! docker info >/dev/null 2>&1; then
+  echo "docker daemon is not reachable; refusing to wipe/regenerate core/." >&2
+  exit 1
+fi
+
 # Wipe core/ so stale generated files never linger, then regenerate.
 find "${OUT}" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
 mkdir -p "${OUT}"
@@ -33,6 +39,17 @@ docker run --rm \
   -v "${OUT}:/out" \
   "${IMAGE}" generate \
     -i /spec/openapi.json -c /config.yaml -o /out
+
+# The core is bundled into @queueflow/sdk, never published on its own: mark
+# the regenerated manifest private so a stray `npm publish` in core/ cannot
+# ship it.
+node -e '
+  const fs = require("fs");
+  const p = process.argv[1];
+  const pkg = JSON.parse(fs.readFileSync(p, "utf8"));
+  pkg.private = true;
+  fs.writeFileSync(p, JSON.stringify(pkg, null, 2) + "\n");
+' "${OUT}/package.json"
 
 echo "==> Regenerated ${OUT} from ${SPEC}"
 echo "==> Run 'npm run typecheck' to verify the facade still matches."
