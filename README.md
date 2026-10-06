@@ -10,7 +10,7 @@ PostgreSQL-native distributed job queue and workflow engine.
 - **Dual ESM + CJS**, ships its own `.d.ts`.
 
 > Built as a thin hand-written facade (`src/`) over a generated core (`core/`: models + transport
-> from the [OpenAPI spec](https://github.com/queueflow/queueflow-core/blob/main/spec/openapi.yaml)).
+> from the [OpenAPI spec](https://github.com/elision-labs/queueflow-core/blob/main/spec/openapi.yaml)).
 > The core is regenerated and never drifts from the server; the facade adds the ergonomics codegen
 > cannot. See [Architecture](#architecture).
 
@@ -229,7 +229,7 @@ facade still matches.
 ## Requirements
 
 - Node.js ≥ 18 (for the global `fetch`).
-- A running QueueFlow server — see [queueflow-core](https://github.com/queueflow/queueflow-core).
+- A running QueueFlow server — see [queueflow-core](https://github.com/elision-labs/queueflow-core).
 
 ## License
 

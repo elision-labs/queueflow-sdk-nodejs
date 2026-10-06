@@ -6,7 +6,7 @@
   "homepage": "https://queueflow.dev",
   "repository": {
     "type": "git",
-    "url": "https://github.com/queueflow/queueflow-sdk-nodejs.git"
+    "url": "https://github.com/elision-labs/queueflow-sdk-nodejs.git"
   },
   "keywords": [
     "queue",
