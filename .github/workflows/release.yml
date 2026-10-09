@@ -1,0 +1,38 @@
+name: Release
+
+# Publish @queueflow/sdk to npm when a v* tag is pushed.
+#
+# Auth: the NPM_TOKEN repository secret must be a granular access token with
+# publish permission on @queueflow/sdk and "bypass 2FA" enabled, otherwise
+# npm answers EOTP in CI. Alternatively configure npm Trusted Publishing for
+# this repo and workflow on npmjs.com, delete the secret, and the id-token
+# permission below lets npm authenticate with GitHub's OIDC token instead.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: npm publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+      - name: Verify the tag matches package.json
+        run: |
+          v="$(node -p "require('./package.json').version")"
+          [ "v${v}" = "${GITHUB_REF_NAME}" ] || { echo "::error::tag ${GITHUB_REF_NAME} != package.json version ${v}" >&2; exit 1; }
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
