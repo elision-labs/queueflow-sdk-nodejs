@@ -195,6 +195,25 @@ command (`make demo PG_PORT=5440 API_PORT=8055`, then `make app API_PORT=8055`,
 `make down API_PORT=8055 PG_PORT=5440`). See that example's README for endpoint
 docs, hitting the engine directly, teardown, and troubleshooting.
 
+## Conformance tests
+
+`test/live.mjs` runs the facade against a real QueueFlow server (started with the default
+`queueflow serve`, i.e. `--mode all`, so the built-in `echo` handler is registered). It creates
+and waits on an `echo` job, checks idempotent re-creation, runs a two-step workflow, exercises the
+cron and dead-letter endpoints, reads stats, and runs `qf.worker.run()` against a dedicated queue.
+It is skipped unless `QUEUEFLOW_URL` is set, so `npm test` and CI stay offline.
+
+```bash
+QUEUEFLOW_URL=http://localhost:8000 \
+QUEUEFLOW_TOKEN=dev \
+QUEUEFLOW_WORKER_TOKEN=worker-secret \
+npm run test:live
+```
+
+`QUEUEFLOW_TOKEN` is the tenant token (default `dev`). `QUEUEFLOW_WORKER_TOKEN` is the server's
+`--worker-token`; it defaults to the tenant token, which only works when the server runs without
+one.
+
 ## Architecture
 
 This package is a thin hand-written **facade** over a **generated core**:
