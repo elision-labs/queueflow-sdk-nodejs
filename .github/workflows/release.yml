@@ -2,11 +2,13 @@ name: Release
 
 # Publish @queueflow/sdk to npm when a v* tag is pushed.
 #
-# Auth: the NPM_TOKEN repository secret must be a granular access token with
-# publish permission on @queueflow/sdk and "bypass 2FA" enabled, otherwise
-# npm answers EOTP in CI. Alternatively configure npm Trusted Publishing for
-# this repo and workflow on npmjs.com, delete the secret, and the id-token
-# permission below lets npm authenticate with GitHub's OIDC token instead.
+# Auth is npm Trusted Publishing: this repo and workflow are registered as a
+# trusted publisher for @queueflow/sdk on npmjs.com, and the id-token
+# permission lets npm exchange GitHub's OIDC token for a short-lived publish
+# credential. No NPM_TOKEN secret is used (a token would take precedence and
+# bypass the trusted-publisher flow). Trusted publishing needs npm >= 11.5.1,
+# hence the explicit npm upgrade; setup-node's registry-url is deliberately
+# not set, since it writes an _authToken line that expects a token env var.
 on:
   push:
     tags: ["v*"]
@@ -17,14 +19,14 @@ permissions:
 
 jobs:
   publish:
-    name: npm publish
+    name: npm publish (trusted publishing)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: https://registry.npmjs.org
+      - run: npm install -g npm@latest && npm --version
       - name: Verify the tag matches package.json
         run: |
           v="$(node -p "require('./package.json').version")"
@@ -32,7 +34,4 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
-      - name: Publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public --provenance
+      - run: npm publish --access public --provenance
