@@ -663,6 +663,8 @@ export class CronResource {
       (init) =>
         this.api.listCrons(
           {
+            status: opts.status,
+            queue: opts.queue,
             limit: opts.limit,
             offset: opts.offset,
             orderBy: opts.orderBy,
@@ -714,6 +716,7 @@ export class DlqResource {
       (init) =>
         this.api.listDeadLetters(
           {
+            status: opts.status,
             queue: opts.queue,
             limit: opts.limit,
             offset: opts.offset,

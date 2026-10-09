@@ -317,3 +317,40 @@ test("non-idempotent writes are not retried", async () => {
   await assert.rejects(() => qf.jobs.enqueue({ taskName: "echo" }), ApiError);
   assert.equal(calls.length, 1, "a write without an idempotency key must be sent once");
 });
+
+// --- list filters ----------------------------------------------------------
+
+const CRON_LIST_FIXTURE = { crons: [], has_more: false, limit: 50, offset: 0 };
+const DLQ_LIST_FIXTURE = { dead_letters: [], has_more: false, limit: 50, offset: 0 };
+
+test("cron.list forwards the status and queue filters", async () => {
+  const { qf, calls } = clientWith([jsonResponse(CRON_LIST_FIXTURE)]);
+
+  await qf.cron.list({ status: "enabled", queue: "billing", limit: 10 });
+
+  const url = new URL(calls[0].url);
+  assert.equal(url.pathname, "/api/v1/cron");
+  assert.equal(url.searchParams.get("status"), "enabled");
+  assert.equal(url.searchParams.get("queue"), "billing");
+  assert.equal(url.searchParams.get("limit"), "10");
+});
+
+test("dlq.list forwards the status filter", async () => {
+  const { qf, calls } = clientWith([jsonResponse(DLQ_LIST_FIXTURE)]);
+
+  await qf.dlq.list({ status: "failed", queue: "billing" });
+
+  const url = new URL(calls[0].url);
+  assert.equal(url.pathname, "/api/v1/dlq");
+  assert.equal(url.searchParams.get("status"), "failed");
+  assert.equal(url.searchParams.get("queue"), "billing");
+});
+
+test("list filters left unset are not sent as query parameters", async () => {
+  const { qf, calls } = clientWith([jsonResponse(CRON_LIST_FIXTURE)]);
+
+  await qf.cron.list();
+
+  const url = new URL(calls[0].url);
+  assert.equal([...url.searchParams.keys()].length, 0, url.search);
+});
