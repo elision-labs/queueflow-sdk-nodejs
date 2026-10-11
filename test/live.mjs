@@ -16,7 +16,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { QueueFlow, wf, NotFoundError } from "../dist/index.js";
+import { QueueFlow, wf, NotFoundError, BadRequestError } from "../dist/index.js";
 
 const URL_ = process.env.QUEUEFLOW_URL;
 const TOKEN = process.env.QUEUEFLOW_TOKEN ?? "dev";
@@ -193,7 +193,162 @@ test("live: worker runtime runs jobs concurrently up to the configured cap", { s
     assert.equal(job.result.handled, true);
   }
 
+  // Since server 0.5.0 every queue the tenant has enqueued to is listed, so a
+  // drained queue shows up with an empty backlog rather than disappearing.
   const queues = await qf.system.queues();
   assert.ok(Array.isArray(queues));
-  assert.ok(!queues.some((q) => q.queue === queue), "a drained queue must not be listed");
+  const drained = queues.find((q) => q.queue === queue);
+  assert.ok(drained, "a queue this tenant enqueued to must be listed");
+  assert.equal(drained.pending, 0);
+  assert.equal(drained.scheduled, 0);
+  assert.equal(drained.running, 0);
+  assert.equal(drained.paused, false);
+});
+
+// --- server 0.5.0: identity, bulk cancel, queue control, bulk replay --------
+//
+// The server and its database may be shared with other test runs, so every
+// bulk operation below is scoped to a queue only this run uses.
+
+test("live: whoami reports the token's tenant and access level", { skip }, async () => {
+  const me = await qf.system.whoami();
+  assert.equal(typeof me.tenant, "string");
+  assert.ok(me.tenant.length > 0, "tenant must not be empty");
+  // The live suite creates jobs, so its token must be read-write.
+  assert.equal(me.access, "read_write");
+});
+
+test("live: bulk cancel is scoped by filter, honours limit, and rejects terminal statuses", { skip }, async () => {
+  // A queue no worker polls, so the jobs stay pending until cancelled.
+  const queue = `node-live-cancel-${suffix}`;
+  const taskA = `sdk-live-cancel-a-${suffix}`;
+  const taskB = `sdk-live-cancel-b-${suffix}`;
+
+  const a1 = await qf.jobs.create({ task: taskA, queue, payload: { n: 1 } });
+  const a2 = await qf.jobs.create({ task: taskA, queue, payload: { n: 2 } });
+  const b1 = await qf.jobs.create({ task: taskB, queue, payload: { n: 3 } });
+
+  // The new task_name filter on list.
+  const onlyA = await qf.jobs.list({ queue, taskName: taskA, limit: 10 });
+  assert.deepEqual(onlyA.jobs.map((j) => j.id).sort(), [a1.id, a2.id].sort());
+  const onlyB = await qf.jobs.list({ queue, taskName: taskB, limit: 10 });
+  assert.deepEqual(onlyB.jobs.map((j) => j.id), [b1.id]);
+
+  // Terminal statuses are refused: history is never rewritten.
+  await assert.rejects(() => qf.jobs.cancelMany({ queue, status: "completed" }), BadRequestError);
+
+  // A filter that matches nothing cancels nothing.
+  assert.equal(await qf.jobs.cancelMany({ queue, taskName: `nope-${suffix}` }), 0);
+
+  // Capped by limit and scoped to the task: exactly one taskA job goes. (The
+  // two were created within the same instant, so "oldest first" may pick
+  // either; the test only relies on the count and the task scope.)
+  assert.equal(await qf.jobs.cancelMany({ queue, taskName: taskA, limit: 1 }), 1);
+  const statuses = await Promise.all([a1, a2].map(async (j) => (await qf.jobs.get(j.id)).status));
+  assert.deepEqual(statuses.slice().sort(), ["cancelled", "pending"], `taskA statuses: ${statuses}`);
+  assert.equal((await qf.jobs.get(b1.id)).status, "pending");
+
+  // The rest of the queue, then nothing is left to cancel.
+  assert.equal(await qf.jobs.cancelMany({ queue, status: "pending" }), 2);
+  for (const j of [a1, a2, b1]) assert.equal((await qf.jobs.get(j.id)).status, "cancelled", j.id);
+  assert.equal(await qf.jobs.cancelMany({ queue }), 0);
+});
+
+test("live: pausing a queue parks its jobs until it is resumed", { skip }, async () => {
+  const queue = `node-live-pause-${suffix}`;
+  const task = `sdk-live-pause-task-${suffix}`;
+  const lease = { maxJobs: 5, leaseSecs: 10, waitSecs: 1 };
+
+  await assert.rejects(() => qf.system.pauseQueue("bad name"), BadRequestError);
+
+  const job = await qf.jobs.create({ task, queue, payload: { parked: true } });
+  try {
+    const paused = await qf.system.pauseQueue(queue);
+    assert.equal(paused.queue, queue);
+    assert.equal(paused.paused, true);
+    assert.equal(paused.pending, 1);
+    assert.equal(paused.running, 0);
+
+    // Idempotent: pausing again reports the same state.
+    assert.equal((await qf.system.pauseQueue(queue)).paused, true);
+
+    // The backlog view flags the queue as paused.
+    const listed = (await qf.system.queues()).find((q) => q.queue === queue);
+    assert.ok(listed, "paused queue with a pending job must be listed");
+    assert.equal(listed.paused, true);
+    assert.equal(listed.pending, 1);
+
+    // No claims while paused: a lease comes back empty once its wait elapses.
+    assert.deepEqual(await qf.worker.lease(queue, lease), []);
+    assert.equal((await qf.jobs.get(job.id)).status, "pending");
+
+    const resumed = await qf.system.resumeQueue(queue);
+    assert.equal(resumed.paused, false);
+    assert.equal(resumed.pending, 1);
+    assert.equal((await qf.system.resumeQueue(queue)).paused, false);
+
+    // Claims flow again.
+    const leased = await qf.worker.lease(queue, lease);
+    assert.equal(leased.length, 1);
+    assert.equal(leased[0].job.id, job.id);
+    await qf.worker.complete(leased[0], { parked: false });
+    assert.equal((await qf.jobs.waitFor(job.id, WAIT)).status, "completed");
+  } finally {
+    // Never leave this run's queue paused or its job pending on a shared server.
+    await qf.system.resumeQueue(queue).catch(() => {});
+    await qf.jobs.cancelMany({ queue }).catch(() => {});
+  }
+});
+
+test("live: dead-letter filters and bulk replay on a dedicated queue", { skip }, async () => {
+  const queue = `node-live-dlq-${suffix}`;
+  const task = `sdk-live-dlq-task-${suffix}`;
+
+  // No retries and a non-retryable failure: the job dead-letters at once.
+  const job = await qf.jobs.create({ task, queue, maxRetries: 0, payload: { attempt: 1 } });
+  const [lease] = await qf.worker.lease(queue, { maxJobs: 1, leaseSecs: 10, waitSecs: 2 });
+  assert.ok(lease, "the job must be leasable");
+  assert.equal(lease.job.id, job.id);
+  await qf.worker.fail(lease, "live test: dead-letter me", { retryable: false });
+  assert.equal((await qf.jobs.waitFor(job.id, WAIT)).status, "failed");
+
+  try {
+    // The new task_name and replayed filters on list.
+    const unreplayed = await qf.dlq.list({ queue, replayed: false, limit: 10 });
+    const entry = unreplayed.dead_letters.find((d) => d.job_id === job.id);
+    assert.ok(entry, "dead letter for the failed job must be listed as unreplayed");
+    assert.equal(entry.task_name, task);
+    const byTask = await qf.dlq.list({ queue, taskName: task, limit: 10 });
+    assert.ok(byTask.dead_letters.some((d) => d.id === entry.id));
+    const otherTask = await qf.dlq.list({ queue, taskName: `nope-${suffix}`, limit: 10 });
+    assert.equal(otherTask.dead_letters.length, 0);
+    const alreadyReplayed = await qf.dlq.list({ queue, replayed: true, limit: 10 });
+    assert.ok(!alreadyReplayed.dead_letters.some((d) => d.id === entry.id));
+
+    // Bulk replay, scoped to this run's queue.
+    const res = await qf.dlq.replayMany({ queue, taskName: task });
+    assert.equal(res.replayed, 1);
+    assert.equal(res.results.length, 1);
+    assert.equal(res.results[0].dead_letter_id, entry.id);
+    assert.equal(typeof res.results[0].job_id, "string");
+    assert.ok(!res.results[0].error, `unexpected error: ${res.results[0].error}`);
+
+    const fresh = await qf.jobs.get(res.results[0].job_id);
+    assert.equal(fresh.task_name, task);
+    assert.notEqual(fresh.id, job.id);
+
+    // The entry has moved from the unreplayed to the replayed set...
+    const after = await qf.dlq.list({ queue, replayed: true, limit: 10 });
+    assert.ok(after.dead_letters.some((d) => d.id === entry.id));
+    const stillUnreplayed = await qf.dlq.list({ queue, replayed: false, limit: 10 });
+    assert.ok(!stillUnreplayed.dead_letters.some((d) => d.id === entry.id));
+
+    // ...so a second bulk replay finds nothing to do.
+    const again = await qf.dlq.replayMany({ queue });
+    assert.equal(again.replayed, 0);
+    assert.deepEqual(again.results, []);
+  } finally {
+    // The replayed job is pending on a queue nobody polls; do not leave it behind.
+    await qf.jobs.cancelMany({ queue }).catch(() => {});
+  }
 });

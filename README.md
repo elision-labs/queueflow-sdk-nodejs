@@ -71,6 +71,10 @@ await qf.health();    // GET /health
 await qf.ready();     // GET /ready
 ```
 
+Methods marked **0.5.0** below call endpoints added in QueueFlow server 0.5.0 (bulk cancel,
+bulk replay, queue pause/resume, `whoami`, and the `taskName` / `replayed` list filters); an
+older server answers them with a 404.
+
 ### Jobs — `qf.jobs`
 
 | Method | Description |
@@ -79,8 +83,9 @@ await qf.ready();     // GET /ready
 | `enqueue(input)` | Enqueue and return just the new job id (no follow-up fetch). |
 | `createBatch(inputs)` | Enqueue up to 1000 jobs at once. |
 | `get(id)` | Fetch a job. |
-| `list(opts?)` | List jobs (`status`, `queue`, `limit`, `offset`, `orderBy`, `cursor`). |
+| `list(opts?)` | List jobs (`status`, `queue`, `taskName` (0.5.0), `limit`, `offset`, `orderBy`, `cursor`, `createdAfter`, `createdBefore`). |
 | `cancel(id)` | Cancel a job. |
+| `cancelMany(filter?)` | **0.5.0** Cancel every non-terminal job matching the filter, oldest first, up to `limit`; returns the count. |
 | `waitFor(id, opts?)` | Poll until `completed` / `failed` / `cancelled`. |
 | `watch(id, opts?)` | Async-iterate the job's status changes (SSE); ends at a terminal state. |
 
@@ -89,6 +94,17 @@ retryDelaySecs?, retryMaxDelaySecs?, jitterFactor?, idempotencyKey?, runAt? }`.
 
 List responses carry `next_cursor` when there are more pages; pass it back as
 `cursor` for keyset pagination (cheaper than deep `offset`).
+
+`cancelMany(filter)` takes `{ queue?, taskName?, status?, createdAfter?, createdBefore?, limit? }`.
+`status` must be `pending`, `retrying` or `running` (all three when omitted); a terminal status is
+a `BadRequestError`, since history is never rewritten. `limit` defaults to 100 and is capped by
+the server's `--max-batch`; a result below `limit` means the matching set is exhausted, so loop
+until then to drain a large set:
+
+```ts
+// Cancel everything still waiting on a queue.
+while ((await qf.jobs.cancelMany({ queue: "billing", status: "pending", limit: 500 })) === 500) {}
+```
 
 ### Workflows — `qf.workflows`
 
@@ -118,12 +134,21 @@ const dag = wf("order_123")
 ```ts
 await qf.system.stats();   // engine counters
 await qf.system.tasks();   // registered task handler names
-await qf.system.queues();  // live per-queue backlog: pending, scheduled, running, oldest pending age
+await qf.system.queues();  // live per-queue backlog: pending, scheduled, running, oldest pending age, paused
+await qf.system.whoami();  // 0.5.0: { tenant, access: "read_write" | "read_only" } for this token
+
+await qf.system.pauseQueue("billing");   // 0.5.0: { queue, paused: true, running, pending }
+await qf.system.resumeQueue("billing");  // 0.5.0: { queue, paused: false, running, pending }
 ```
 
-`queues()` (`GET /api/v1/queues`) lists every queue that currently has non-terminal jobs, so
-you can decide whether to add workers; queues with nothing pending, scheduled or running are
-omitted.
+`queues()` (`GET /api/v1/queues`) lists the live backlog per queue so you can decide whether to
+add workers. Since server 0.5.0 it lists every queue the tenant has enqueued to (with zero counts
+once drained) plus any queue with non-terminal jobs, and each entry carries a `paused` flag.
+
+`pauseQueue(name)` stops claims of this tenant's jobs on that queue: pending jobs wait, running
+jobs finish, so the queue is drained once the returned `running` reaches zero. `resumeQueue(name)`
+lets claims flow again and wakes parked workers. Both are idempotent and return the queue's live
+counts with its new flag; an invalid queue name is a `BadRequestError`.
 
 ### Worker — `qf.worker`
 
@@ -186,8 +211,15 @@ server's `--worker-token` and pass it as `workerToken`; `run()` throws on
 
 | Method | Description |
 | --- | --- |
-| `list(opts?)` · `get(id)` | Inspect terminally-failed jobs. |
+| `list(opts?)` · `get(id)` | Inspect terminally-failed jobs. `list` also takes `taskName` and `replayed` (`false` = not yet replayed, `true` = already replayed) since 0.5.0. |
 | `replay(id)` | Re-run one as a fresh job (at most once; a second replay is a 409). |
+| `replayMany(filter?)` | **0.5.0** Replay every unreplayed entry matching `{ queue?, taskName?, createdAfter?, createdBefore?, limit? }`, oldest first. |
+
+`replayMany` returns `{ results, replayed }`: one entry per dead letter considered, each with the
+fresh `job_id` or an `error` explaining why it could not be replayed (for example the original job
+was purged by retention), and `replayed` counting the successes. Already-replayed entries are
+skipped, so repeating the call with the same filter is harmless. `limit` defaults to 100 and is
+capped by the server's `--max-batch`.
 
 ### Errors
 
@@ -234,8 +266,11 @@ docs, hitting the engine directly, teardown, and troubleshooting.
 `test/live.mjs` runs the facade against a real QueueFlow server (started with the default
 `queueflow serve`, i.e. `--mode all`, so the built-in `echo` handler is registered). It creates
 and waits on an `echo` job, checks idempotent re-creation, runs a two-step workflow, exercises the
-cron and dead-letter endpoints, reads stats, and runs `qf.worker.run()` against a dedicated queue.
-It is skipped unless `QUEUEFLOW_URL` is set, so `npm test` and CI stay offline.
+cron and dead-letter endpoints, reads stats, runs `qf.worker.run()` against a dedicated queue, and
+(against server 0.5.0) checks `whoami`, bulk cancel, queue pause/resume, and bulk dead-letter
+replay. Every bulk operation is scoped to a queue name unique to the run, so the suite is safe to
+point at a shared development server. It is skipped unless `QUEUEFLOW_URL` is set, so `npm test`
+and CI stay offline.
 
 ```bash
 QUEUEFLOW_URL=http://localhost:8000 \

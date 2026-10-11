@@ -18,6 +18,7 @@ import {
   WorkflowBuilder,
   WorkflowValidationError,
   ApiError,
+  BadRequestError,
   NotFoundError,
   TimeoutError,
   AbortError,
@@ -355,6 +356,195 @@ test("list filters left unset are not sent as query parameters", async () => {
   assert.equal([...url.searchParams.keys()].length, 0, url.search);
 });
 
+test("jobs.list forwards the taskName filter as task_name", async () => {
+  const { qf, calls } = clientWith([
+    jsonResponse({ jobs: [], has_more: false, limit: 50, offset: 0 }),
+  ]);
+
+  await qf.jobs.list({ queue: "billing", taskName: "send-invoice", status: "pending" });
+
+  const url = new URL(calls[0].url);
+  assert.equal(url.pathname, "/api/v1/jobs");
+  assert.equal(url.searchParams.get("task_name"), "send-invoice");
+  assert.equal(url.searchParams.get("queue"), "billing");
+  assert.equal(url.searchParams.get("status"), "pending");
+  assert.equal(url.searchParams.has("replayed"), false);
+});
+
+test("dlq.list forwards the taskName and replayed filters", async () => {
+  const { qf, calls } = clientWith([jsonResponse(DLQ_LIST_FIXTURE)]);
+
+  await qf.dlq.list({ taskName: "send-invoice", replayed: false });
+  await qf.dlq.list({ replayed: true });
+  await qf.dlq.list({ queue: "billing" });
+
+  const first = new URL(calls[0].url);
+  assert.equal(first.searchParams.get("task_name"), "send-invoice");
+  // `false` is a real filter value (unreplayed only) and must not be dropped.
+  assert.equal(first.searchParams.get("replayed"), "false");
+  assert.equal(new URL(calls[1].url).searchParams.get("replayed"), "true");
+  const third = new URL(calls[2].url);
+  assert.equal(third.searchParams.has("replayed"), false);
+  assert.equal(third.searchParams.has("task_name"), false);
+});
+
+// --- bulk cancel / bulk replay (server 0.5.0) -------------------------------
+
+test("jobs.cancelMany posts a snake_case filter and returns the cancelled count", async () => {
+  const { qf, calls } = clientWith([jsonResponse({ cancelled: 7 })]);
+
+  const cancelled = await qf.jobs.cancelMany({
+    queue: "billing",
+    taskName: "send-invoice",
+    status: "pending",
+    createdAfter: "2026-01-01T00:00:00Z",
+    createdBefore: new Date("2026-02-01T00:00:00Z"),
+    limit: 10,
+  });
+
+  assert.equal(cancelled, 7);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "POST");
+  assert.equal(new URL(calls[0].url).pathname, "/api/v1/jobs/cancel");
+  assert.deepEqual(JSON.parse(calls[0].body), {
+    queue: "billing",
+    task_name: "send-invoice",
+    status: "pending",
+    created_after: "2026-01-01T00:00:00.000Z",
+    created_before: "2026-02-01T00:00:00.000Z",
+    limit: 10,
+  });
+});
+
+test("jobs.cancelMany with no filter sends an empty body", async () => {
+  const { qf, calls } = clientWith([jsonResponse({ cancelled: 0 })]);
+
+  assert.equal(await qf.jobs.cancelMany(), 0);
+  assert.deepEqual(JSON.parse(calls[0].body), {});
+});
+
+test("jobs.cancelMany surfaces a terminal-status rejection as BadRequestError and is not retried", async () => {
+  const { qf, calls } = clientWith(
+    [jsonResponse({ error: "status must be pending, retrying or running" }, 400)],
+    { maxRetries: 3 },
+  );
+
+  await assert.rejects(() => qf.jobs.cancelMany({ status: "completed" }), BadRequestError);
+  assert.equal(calls.length, 1);
+});
+
+test("jobs.cancelMany is not replayed on a retryable 5xx", async () => {
+  const { qf, calls } = clientWith([jsonResponse({ error: "unavailable" }, 503)], {
+    maxRetries: 3,
+  });
+
+  await assert.rejects(() => qf.jobs.cancelMany({ queue: "billing" }), ApiError);
+  assert.equal(calls.length, 1, "a bulk cancel is not idempotent and must be sent once");
+});
+
+test("dlq.replayMany posts a snake_case filter and returns the per-entry results", async () => {
+  const body = {
+    results: [
+      { dead_letter_id: 1, job_id: "job-9", error: null },
+      { dead_letter_id: 2, job_id: null, error: "original job purged by retention" },
+    ],
+    replayed: 1,
+  };
+  const { qf, calls } = clientWith([jsonResponse(body)]);
+
+  const res = await qf.dlq.replayMany({
+    queue: "billing",
+    taskName: "send-invoice",
+    createdAfter: new Date("2026-01-01T00:00:00Z"),
+    limit: 50,
+  });
+
+  assert.equal(res.replayed, 1);
+  assert.equal(res.results.length, 2);
+  assert.equal(res.results[0].dead_letter_id, 1);
+  assert.equal(res.results[0].job_id, "job-9");
+  assert.equal(res.results[1].error, "original job purged by retention");
+  assert.equal(calls[0].method, "POST");
+  assert.equal(new URL(calls[0].url).pathname, "/api/v1/dlq/replay");
+  assert.deepEqual(JSON.parse(calls[0].body), {
+    queue: "billing",
+    task_name: "send-invoice",
+    created_after: "2026-01-01T00:00:00.000Z",
+    limit: 50,
+  });
+});
+
+test("dlq.replayMany with no filter sends an empty body and is not retried on 5xx", async () => {
+  const ok = clientWith([jsonResponse({ results: [], replayed: 0 })]);
+  const res = await ok.qf.dlq.replayMany();
+  assert.deepEqual(res, { results: [], replayed: 0 });
+  assert.deepEqual(JSON.parse(ok.calls[0].body), {});
+
+  const down = clientWith([jsonResponse({ error: "unavailable" }, 503)], { maxRetries: 3 });
+  await assert.rejects(() => down.qf.dlq.replayMany({ queue: "billing" }), ApiError);
+  assert.equal(down.calls.length, 1);
+});
+
+// --- queue control and identity (server 0.5.0) ------------------------------
+
+const QUEUE_CONTROL_FIXTURE = { queue: "billing", paused: true, running: 2, pending: 5 };
+
+test("system.pauseQueue posts to the queue's pause route and returns its live counts", async () => {
+  const { qf, calls } = clientWith([jsonResponse(QUEUE_CONTROL_FIXTURE)]);
+
+  const res = await qf.system.pauseQueue("billing");
+
+  assert.deepEqual(res, QUEUE_CONTROL_FIXTURE);
+  assert.equal(calls[0].method, "POST");
+  assert.equal(new URL(calls[0].url).pathname, "/api/v1/queues/billing/pause");
+});
+
+test("system.resumeQueue posts to the queue's resume route", async () => {
+  const { qf, calls } = clientWith([jsonResponse({ ...QUEUE_CONTROL_FIXTURE, paused: false })]);
+
+  const res = await qf.system.resumeQueue("billing");
+
+  assert.equal(res.paused, false);
+  assert.equal(calls[0].method, "POST");
+  assert.equal(new URL(calls[0].url).pathname, "/api/v1/queues/billing/resume");
+});
+
+test("queue control encodes the queue name in the path", async () => {
+  const { qf, calls } = clientWith([jsonResponse(QUEUE_CONTROL_FIXTURE)]);
+  await qf.system.pauseQueue("team/billing");
+  assert.equal(new URL(calls[0].url).pathname, "/api/v1/queues/team%2Fbilling/pause");
+});
+
+test("queue control is idempotent and retried on a retryable 5xx", async () => {
+  let n = 0;
+  const { fetchImpl, calls } = stubFetch([
+    () => (++n === 1 ? jsonResponse({ error: "bad gateway" }, 502) : jsonResponse(QUEUE_CONTROL_FIXTURE)),
+  ]);
+  const qf = new QueueFlow({ baseUrl: "http://qf.test", token: "t", fetch: fetchImpl, maxRetries: 2 });
+
+  const res = await qf.system.pauseQueue("billing");
+
+  assert.equal(res.paused, true);
+  assert.equal(calls.length, 2);
+});
+
+test("queue control maps an invalid queue name to BadRequestError", async () => {
+  const { qf } = clientWith([jsonResponse({ error: "validation error: queue name" }, 400)]);
+  await assert.rejects(() => qf.system.pauseQueue("bad name"), BadRequestError);
+  await assert.rejects(() => qf.system.resumeQueue("bad name"), BadRequestError);
+});
+
+test("system.whoami returns the tenant and access level", async () => {
+  const { qf, calls } = clientWith([jsonResponse({ tenant: "acme", access: "read_only" })]);
+
+  const me = await qf.system.whoami();
+
+  assert.deepEqual(me, { tenant: "acme", access: "read_only" });
+  assert.equal(calls[0].method, "GET");
+  assert.equal(new URL(calls[0].url).pathname, "/api/v1/whoami");
+  assert.equal(new Headers(calls[0].headers).get("Authorization"), "Bearer test-token");
+});
+
 // --- worker runtime --------------------------------------------------------
 
 const leasedJob = (id, task = "work") => ({
@@ -413,7 +603,9 @@ function workerServer(jobs, { heartbeat = "running" } = {}) {
     }
     if (url.pathname === "/api/v1/queues") {
       return jsonResponse({
-        queues: [{ queue: "default", pending: 2, scheduled: 1, running: 1, oldest_pending_age_secs: 7 }],
+        queues: [
+          { queue: "default", pending: 2, scheduled: 1, running: 1, oldest_pending_age_secs: 7, paused: false },
+        ],
       });
     }
     throw new Error(`unexpected request ${init?.method ?? "GET"} ${url.pathname}`);
@@ -642,6 +834,6 @@ test("system.queues returns the per-queue backlog", async () => {
   const { qf } = workerServer([]);
   const queues = await qf.system.queues();
   assert.deepEqual(queues, [
-    { queue: "default", pending: 2, scheduled: 1, running: 1, oldest_pending_age_secs: 7 },
+    { queue: "default", pending: 2, scheduled: 1, running: 1, oldest_pending_age_secs: 7, paused: false },
   ]);
 });

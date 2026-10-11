@@ -13,6 +13,8 @@ src/apis/WorkflowsApi.ts
 src/apis/index.ts
 src/index.ts
 src/models/BackoffStrategy.ts
+src/models/CancelJobsRequest.ts
+src/models/CancelJobsResponse.ts
 src/models/CompleteJobRequest.ts
 src/models/CreateBatchJobsRequest.ts
 src/models/CreateBatchJobsResponse.ts
@@ -42,13 +44,18 @@ src/models/ListJobsResponse.ts
 src/models/ListWorkflowsResponse.ts
 src/models/OnFailure.ts
 src/models/OnSuccess.ts
+src/models/QueueControlResponse.ts
 src/models/QueueStats.ts
 src/models/QueuesResponse.ts
 src/models/ReadyStatus.ts
 src/models/ReplayDeadLetterResponse.ts
+src/models/ReplayDeadLettersRequest.ts
+src/models/ReplayDeadLettersResponse.ts
+src/models/ReplayedDeadLetter.ts
 src/models/StatsSnapshot.ts
 src/models/StepStatus.ts
 src/models/TasksResponse.ts
+src/models/WhoAmIResponse.ts
 src/models/Workflow.ts
 src/models/WorkflowDiagramResponse.ts
 src/models/WorkflowStatus.ts

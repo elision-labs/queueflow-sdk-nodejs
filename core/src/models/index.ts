@@ -1,6 +1,8 @@
 /* tslint:disable */
 /* eslint-disable */
 export * from './BackoffStrategy';
+export * from './CancelJobsRequest';
+export * from './CancelJobsResponse';
 export * from './CompleteJobRequest';
 export * from './CreateBatchJobsRequest';
 export * from './CreateBatchJobsResponse';
@@ -30,13 +32,18 @@ export * from './ListJobsResponse';
 export * from './ListWorkflowsResponse';
 export * from './OnFailure';
 export * from './OnSuccess';
+export * from './QueueControlResponse';
 export * from './QueueStats';
 export * from './QueuesResponse';
 export * from './ReadyStatus';
 export * from './ReplayDeadLetterResponse';
+export * from './ReplayDeadLettersRequest';
+export * from './ReplayDeadLettersResponse';
+export * from './ReplayedDeadLetter';
 export * from './StatsSnapshot';
 export * from './StepStatus';
 export * from './TasksResponse';
+export * from './WhoAmIResponse';
 export * from './Workflow';
 export * from './WorkflowDiagramResponse';
 export * from './WorkflowStatus';

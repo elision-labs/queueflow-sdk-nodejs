@@ -39,6 +39,9 @@ import type {
   HealthStatus,
   ReadyStatus,
   QueueStats,
+  QueueControlResponse,
+  ReplayDeadLettersResponse,
+  WhoAmIResponse,
 } from "../core/src/models/index";
 import {
   AbortError,
@@ -115,6 +118,69 @@ export interface ListOptions {
   createdAfter?: Date | string;
   /** Only rows created strictly before this instant (exclusive). */
   createdBefore?: Date | string;
+}
+
+/** Filters for `jobs.list()`. */
+export interface ListJobsOptions extends ListOptions {
+  /** Only jobs for this task handler (server 0.5.0+). */
+  taskName?: string;
+}
+
+/** Filters for `dlq.list()`. */
+export interface ListDeadLettersOptions extends ListOptions {
+  /** Only dead letters for this task handler (server 0.5.0+). */
+  taskName?: string;
+  /**
+   * `false` lists entries not yet replayed, `true` the replayed ones; both
+   * when omitted (server 0.5.0+).
+   */
+  replayed?: boolean;
+}
+
+/**
+ * Which jobs a bulk cancel applies to. Every field is optional; an empty
+ * filter cancels the caller's oldest non-terminal jobs up to `limit`.
+ */
+export interface CancelJobsFilter {
+  /** Only jobs on this queue. */
+  queue?: string;
+  /** Only jobs for this task handler. */
+  taskName?: string;
+  /**
+   * Only jobs in this state (all three when omitted). Terminal states are
+   * rejected with a 400 {@link BadRequestError}: history is never rewritten.
+   */
+  status?: "pending" | "retrying" | "running";
+  /** Only jobs created at or after this instant (inclusive). */
+  createdAfter?: Date | string;
+  /** Only jobs created strictly before this instant (exclusive). */
+  createdBefore?: Date | string;
+  /**
+   * Cancel at most this many, oldest first (default 100; the server caps it
+   * at its `--max-batch`, 1000 by default).
+   */
+  limit?: number;
+}
+
+/**
+ * Which dead letters a bulk replay applies to. Every field is optional; an
+ * empty filter replays the caller's oldest unreplayed dead letters up to
+ * `limit`.
+ */
+export interface ReplayDeadLettersFilter {
+  /** Only dead letters from this queue. */
+  queue?: string;
+  /** Only dead letters for this task handler. */
+  taskName?: string;
+  /** Only entries created at or after this instant (inclusive). */
+  createdAfter?: Date | string;
+  /** Only entries created strictly before this instant (exclusive). */
+  createdBefore?: Date | string;
+  /**
+   * Consider at most this many entries, oldest first (default 100; the
+   * server caps it at its `--max-batch`).
+   */
+  limit?: number;
 }
 
 function toDate(v: Date | string | undefined): Date | undefined {
@@ -279,7 +345,7 @@ export class JobsResource {
     });
   }
 
-  list(opts: ListOptions = {}): Promise<ListJobsResponse> {
+  list(opts: ListJobsOptions = {}): Promise<ListJobsResponse> {
     return this.t.call(
       "listJobs",
       (init) =>
@@ -287,6 +353,7 @@ export class JobsResource {
           {
             status: opts.status,
             queue: opts.queue,
+            taskName: opts.taskName,
             limit: opts.limit,
             offset: opts.offset,
             orderBy: opts.orderBy,
@@ -303,6 +370,32 @@ export class JobsResource {
 
   cancel(id: string): Promise<void> {
     return this.t.call("cancelJob", (init) => this.api.cancelJob({ id }, init));
+  }
+
+  /**
+   * Cancel every non-terminal job matching `filter`, oldest first, up to
+   * `filter.limit` (default 100); returns how many were cancelled. A result
+   * below `limit` means the matching set is exhausted, so repeat until then
+   * to drain a large set. Jobs that finish concurrently keep their outcome.
+   * Requires server 0.5.0.
+   */
+  async cancelMany(filter: CancelJobsFilter = {}): Promise<number> {
+    const res = await this.t.call("cancelJobs", (init) =>
+      this.api.cancelJobs(
+        {
+          cancelJobsRequest: {
+            queue: filter.queue,
+            task_name: filter.taskName,
+            status: filter.status,
+            created_after: toDate(filter.createdAfter),
+            created_before: toDate(filter.createdBefore),
+            limit: filter.limit,
+          },
+        },
+        init,
+      ),
+    );
+    return res.cancelled;
   }
 
   /** Poll until the job reaches a terminal state (completed/failed/cancelled). */
@@ -864,7 +957,7 @@ export class DlqResource {
     this.api = new DlqApi(t.config);
   }
 
-  list(opts: ListOptions = {}): Promise<ListDeadLettersResponse> {
+  list(opts: ListDeadLettersOptions = {}): Promise<ListDeadLettersResponse> {
     return this.t.call(
       "listDeadLetters",
       (init) =>
@@ -872,6 +965,8 @@ export class DlqResource {
           {
             status: opts.status,
             queue: opts.queue,
+            taskName: opts.taskName,
+            replayed: opts.replayed,
             limit: opts.limit,
             offset: opts.offset,
             orderBy: opts.orderBy,
@@ -903,9 +998,34 @@ export class DlqResource {
     );
     return res.job_id;
   }
+
+  /**
+   * Replay every unreplayed dead letter matching `filter`, oldest first, up
+   * to `filter.limit` (default 100). Each entry in `results` carries the
+   * fresh `job_id`, or an `error` saying why it could not be replayed (for
+   * example the original job was purged by retention); `replayed` counts the
+   * successes. Entries already replayed are skipped, so calling this again
+   * with the same filter is harmless. Requires server 0.5.0.
+   */
+  replayMany(filter: ReplayDeadLettersFilter = {}): Promise<ReplayDeadLettersResponse> {
+    return this.t.call("replayDeadLetters", (init) =>
+      this.api.replayDeadLetters(
+        {
+          replayDeadLettersRequest: {
+            queue: filter.queue,
+            task_name: filter.taskName,
+            created_after: toDate(filter.createdAfter),
+            created_before: toDate(filter.createdBefore),
+            limit: filter.limit,
+          },
+        },
+        init,
+      ),
+    );
+  }
 }
 
-/** Engine introspection: counters and registered task handlers. */
+/** Engine introspection and control: counters, task handlers, queues, identity. */
 export class SystemResource {
   private readonly api: SystemApi;
   constructor(private readonly t: Transport) {
@@ -927,13 +1047,45 @@ export class SystemResource {
   /**
    * Live backlog per queue (`GET /api/v1/queues`): claimable `pending`,
    * future-dated `scheduled`, and `running` counts, plus how long the oldest
-   * claimable job has waited. Queues with no non-terminal jobs are omitted.
+   * claimable job has waited and (server 0.5.0+) whether the queue is
+   * `paused`. Lists every queue this tenant has enqueued to (since server
+   * 0.5.0) and any queue with non-terminal jobs.
    */
   async queues(): Promise<QueueStats[]> {
     const res = await this.t.call("listQueues", (init) => this.api.listQueues(init), {
       idempotent: true,
     });
     return res.queues;
+  }
+
+  /**
+   * Stop claims of this tenant's jobs on `queue`: pending jobs wait, running
+   * jobs finish, so the queue is drained once the returned `running` reaches
+   * zero. Idempotent. An invalid queue name is a 400 {@link BadRequestError}.
+   * Requires server 0.5.0.
+   */
+  pauseQueue(queue: string): Promise<QueueControlResponse> {
+    return this.t.call("pauseQueue", (init) => this.api.pauseQueue({ queue }, init), {
+      idempotent: true,
+    });
+  }
+
+  /**
+   * Resume claims on `queue` immediately; parked workers are woken.
+   * Idempotent. Requires server 0.5.0.
+   */
+  resumeQueue(queue: string): Promise<QueueControlResponse> {
+    return this.t.call("resumeQueue", (init) => this.api.resumeQueue({ queue }, init), {
+      idempotent: true,
+    });
+  }
+
+  /**
+   * The tenant this client's token is scoped to and its access level
+   * (`read_write`, or `read_only` for a read-only key). Requires server 0.5.0.
+   */
+  whoami(): Promise<WhoAmIResponse> {
+    return this.t.call("whoAmI", (init) => this.api.whoAmI(init), { idempotent: true });
   }
 }
 
