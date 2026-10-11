@@ -129,14 +129,71 @@ test("live: worker runtime leases and completes a job on a dedicated queue", { s
   );
 
   let done;
+  let result;
   try {
     done = await qf.jobs.waitFor(job.id, WAIT);
   } finally {
     controller.abort();
-    await worker;
+    result = await worker;
   }
 
   assert.deepEqual(handled, [job.id]);
+  assert.deepEqual(result, { unfinished: [] });
   assert.equal(done.status, "completed", `error: ${done.error_message}`);
   assert.deepEqual(done.result, { ...payload, handled: true });
+});
+
+test("live: worker runtime runs jobs concurrently up to the configured cap", { skip }, async () => {
+  const queue = `sdk-live-cq-${suffix}`;
+  const task = `sdk-live-ctask-${suffix}`;
+  const count = 4;
+
+  const jobs = await Promise.all(
+    Array.from({ length: count }, (_, i) => qf.jobs.create({ task, payload: { i }, queue })),
+  );
+
+  const controller = new AbortController();
+  let active = 0;
+  let maxActive = 0;
+  const started = new Set();
+  const worker = qf.worker.run(
+    queue,
+    {
+      [task]: async (leased) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        started.add(leased.id);
+        // Long enough that the four leases overlap in time.
+        await new Promise((r) => setTimeout(r, 750));
+        active -= 1;
+        return { ...leased.payload, handled: true };
+      },
+    },
+    { concurrency: count, leaseSecs: 10, waitSecs: 2, signal: controller.signal },
+  );
+
+  let finished;
+  let result;
+  try {
+    finished = await Promise.all(jobs.map((job) => qf.jobs.waitFor(job.id, WAIT)));
+  } finally {
+    const t0 = Date.now();
+    controller.abort();
+    result = await worker;
+    // Stop must interrupt the long poll rather than wait out waitSecs.
+    assert.ok(Date.now() - t0 < 1_500, "stop waited for the long poll");
+  }
+
+  assert.deepEqual(result, { unfinished: [] });
+  assert.equal(started.size, count);
+  assert.ok(maxActive > 1, `handlers never overlapped (max active ${maxActive})`);
+  assert.ok(maxActive <= count, `concurrency cap exceeded (${maxActive} > ${count})`);
+  for (const job of finished) {
+    assert.equal(job.status, "completed", `job ${job.id}: ${job.error_message}`);
+    assert.equal(job.result.handled, true);
+  }
+
+  const queues = await qf.system.queues();
+  assert.ok(Array.isArray(queues));
+  assert.ok(!queues.some((q) => q.queue === queue), "a drained queue must not be listed");
 });

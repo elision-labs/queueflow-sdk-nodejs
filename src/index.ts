@@ -26,6 +26,8 @@ export type {
   WaitOptions,
   WorkerContext,
   WorkerHandler,
+  WorkerRunOptions,
+  WorkerRunResult,
 } from "./client";
 
 export { wf, WorkflowBuilder, WorkflowValidationError } from "./workflow";
@@ -71,4 +73,6 @@ export type {
   WorkflowDiagramResponse,
   HealthStatus,
   ReadyStatus,
+  QueueStats,
+  QueuesResponse,
 } from "../core/src/models/index";

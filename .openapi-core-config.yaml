@@ -9,3 +9,7 @@ additionalProperties:
   typescriptThreePlus: true
   modelPropertyNaming: original
   hideGenerationTimestamp: true
+# Keeps the regenerated core/package.json repository URL pointing at this repo
+# (without these the generator emits GIT_USER_ID/GIT_REPO_ID placeholders).
+gitUserId: elision-labs
+gitRepoId: queueflow-sdk-nodejs

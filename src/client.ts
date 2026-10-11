@@ -38,6 +38,7 @@ import type {
   ListDeadLettersResponse,
   HealthStatus,
   ReadyStatus,
+  QueueStats,
 } from "../core/src/models/index";
 import {
   AbortError,
@@ -172,31 +173,51 @@ class Transport {
     });
   }
 
-  private initOverrides(timeoutMs?: number): RequestInit | undefined {
-    const ms = timeoutMs ?? this.timeoutMs;
-    return ms > 0 ? { signal: AbortSignal.timeout(ms) } : undefined;
-  }
-
-  /** Run a generated-core call with typed-error mapping and idempotent retry. */
+  /**
+   * Run a generated-core call with typed-error mapping and idempotent retry.
+   *
+   * The request is aborted by the per-request timeout or by the caller's
+   * `signal`, whichever fires first. A caller abort throws {@link AbortError}
+   * at once and is never retried (the caller no longer wants the result, e.g.
+   * a worker stopping in the middle of a long poll); a timeout surfaces as a
+   * {@link ConnectionError} and follows the normal retry policy.
+   */
   async call<T>(
     label: string,
     fn: (init?: RequestInit) => Promise<T>,
-    opts: { idempotent?: boolean; timeoutMs?: number } = {},
+    opts: { idempotent?: boolean; timeoutMs?: number; signal?: AbortSignal } = {},
   ): Promise<T> {
     const attempts = (opts.idempotent ? this.retries : 0) + 1;
+    const ms = opts.timeoutMs ?? this.timeoutMs;
+    const caller = opts.signal;
     let last: Error | undefined;
     for (let attempt = 0; attempt < attempts; attempt++) {
+      if (caller?.aborted) throw new AbortError(`${label} aborted`);
+      const ctl = new AbortController();
+      const timer =
+        ms > 0
+          ? setTimeout(
+              () => ctl.abort(new DOMException(`${label} timed out after ${ms}ms`, "TimeoutError")),
+              ms,
+            )
+          : undefined;
+      const onAbort = () => ctl.abort(caller?.reason);
+      caller?.addEventListener("abort", onAbort, { once: true });
       try {
-        return await fn(this.initOverrides(opts.timeoutMs));
+        return await fn({ signal: ctl.signal });
       } catch (raw) {
+        if (caller?.aborted) throw new AbortError(`${label} aborted`);
         const err = await toQueueFlowError(raw, label);
         const retryable =
           err instanceof ConnectionError ||
           (err instanceof ApiError && RETRYABLE_STATUS.has(err.status));
         if (!retryable || attempt === attempts - 1) throw err;
         last = err;
-        await sleep(backoffMs(attempt));
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        caller?.removeEventListener("abort", onAbort);
       }
+      await sleep(backoffMs(attempt), caller);
     }
     throw last;
   }
@@ -440,10 +461,13 @@ export class WorkerResource {
     this.api = new WorkerApi(t.workerConfig);
   }
 
-  /** Lease up to `maxJobs` jobs, long-polling up to `waitSecs` when empty. */
+  /**
+   * Lease up to `maxJobs` jobs, long-polling up to `waitSecs` when empty.
+   * `signal` aborts the long poll early (throws {@link AbortError}).
+   */
   async lease(
     queue: string,
-    opts: { maxJobs?: number; leaseSecs?: number; waitSecs?: number } = {},
+    opts: { maxJobs?: number; leaseSecs?: number; waitSecs?: number; signal?: AbortSignal } = {},
   ): Promise<LeasedJob[]> {
     const res = await this.t.call(
       "leaseJobs",
@@ -460,7 +484,7 @@ export class WorkerResource {
           init,
         ),
       // Leasing is replay-safe; a long poll must outlive the default timeout.
-      { idempotent: true, timeoutMs: ((opts.waitSecs ?? 0) + 35) * 1_000 },
+      { idempotent: true, timeoutMs: ((opts.waitSecs ?? 0) + 35) * 1_000, signal: opts.signal },
     );
     return res.jobs;
   }
@@ -510,38 +534,72 @@ export class WorkerResource {
 
   /**
    * Run a worker loop: lease, dispatch to `handlers` by task name, heartbeat
-   * while the handler runs, and report the outcome. Resolves when `signal`
-   * aborts; throws on 401/403 from the lease call (a wrong or missing worker
-   * token cannot heal by retrying). Handlers should be idempotent (delivery
-   * is at-least-once) and should honour `ctx.signal`, which aborts when the
-   * job's lease is lost (cancelled mid-run or reclaimed) — from then on the
-   * server owns the outcome and any further work is wasted.
+   * while the handler runs, and report the outcome.
+   *
+   * Up to `concurrency` handlers run at once (default 1): each lease asks for
+   * as many jobs as there are free slots, and no further lease is issued while
+   * every slot is busy. Each in-flight job gets its own heartbeat at half the
+   * lease interval.
+   *
+   * Stopping: aborting `signal` cancels the in-flight long poll immediately
+   * (no waiting out `waitSecs`), then in-flight handlers get up to
+   * `drainTimeoutMs` (default 30s) to finish and report. Handlers still
+   * running after that have their `ctx.signal` aborted and are left
+   * unreported, so their leases expire and the server redelivers; they are
+   * listed in the result's `unfinished`. `run()` resolves once the drain is
+   * over.
+   *
+   * Throws on 401/403 from the lease call (a wrong or missing worker token
+   * cannot heal by retrying), after draining the same way. Handlers should be
+   * idempotent (delivery is at-least-once) and should honour `ctx.signal`,
+   * which aborts when the job's lease is lost (cancelled mid-run or
+   * reclaimed) or when the drain gives up on it; from then on the server owns
+   * the outcome and any further work is wasted.
    */
   async run(
     queue: string,
     handlers: Record<string, WorkerHandler>,
-    opts: {
-      leaseSecs?: number;
-      waitSecs?: number;
-      signal?: AbortSignal;
-      /** Called on transient lease errors (default: throttled console.warn). */
-      onError?: (error: Error) => void;
-    } = {},
-  ): Promise<void> {
+    opts: WorkerRunOptions = {},
+  ): Promise<WorkerRunResult> {
     const leaseSecs = opts.leaseSecs ?? 30;
     const waitSecs = opts.waitSecs ?? 20;
+    const concurrency = Math.max(1, Math.floor(opts.concurrency ?? 1));
+    const drainTimeoutMs = opts.drainTimeoutMs ?? 30_000;
+    const signal = opts.signal;
+    const inFlight = new Set<InFlightJob>();
+    // Resolves when the caller asks to stop; never resolves without a signal.
+    const stopped = new Promise<void>((resolve) => {
+      if (!signal) return;
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
     let failures = 0;
-    while (!opts.signal?.aborted) {
+    let fatal: Error | undefined;
+
+    while (!signal?.aborted) {
+      if (inFlight.size >= concurrency) {
+        // Every slot is busy: no lease until a handler settles (or we stop).
+        await Promise.race([...[...inFlight].map((j) => j.done), stopped]);
+        continue;
+      }
       let leases: LeasedJob[];
       try {
-        leases = await this.lease(queue, { maxJobs: 1, leaseSecs, waitSecs });
+        leases = await this.lease(queue, {
+          // The server caps max_jobs at 100 per call.
+          maxJobs: Math.min(concurrency - inFlight.size, 100),
+          leaseSecs,
+          waitSecs,
+          signal,
+        });
         failures = 0;
       } catch (err) {
+        if (signal?.aborted) break; // stop interrupted the long poll
         const error = err instanceof Error ? err : new Error(String(err));
         // Auth errors cannot heal by retrying: surface them instead of
         // spinning silently at 1 req/s with a bad or missing worker token.
         if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
-          throw error;
+          fatal = error;
+          break;
         }
         failures += 1;
         if (opts.onError) {
@@ -551,72 +609,168 @@ export class WorkerResource {
             `[queueflow] worker lease failed (${failures} consecutive): ${error.message}`,
           );
         }
-        await sleep(1_000, opts.signal);
+        await sleep(1_000, signal);
         continue;
       }
       for (const lease of leases) {
-        await this.runOne(lease, handlers, leaseSecs);
+        const job = this.startOne(lease, handlers, leaseSecs);
+        inFlight.add(job);
+        // `done` never rejects (startOne reports or swallows everything), but
+        // free the slot on either path so one bug cannot wedge the loop.
+        const release = () => inFlight.delete(job);
+        void job.done.then(release, release);
       }
     }
+
+    const unfinished = await drain(inFlight, drainTimeoutMs);
+    if (fatal) throw fatal;
+    return { unfinished };
   }
 
-  private async runOne(
+  /**
+   * Start one leased job: heartbeat while the handler runs, then report. The
+   * returned `done` promise never rejects. `abandon()` stops the heartbeat
+   * and aborts `ctx.signal`; nothing is reported afterwards, so the lease
+   * expires and the server redelivers.
+   */
+  private startOne(
     lease: LeasedJob,
     handlers: Record<string, WorkerHandler>,
     leaseSecs: number,
-  ): Promise<void> {
-    const handler = handlers[lease.job.task_name];
-    if (!handler) {
-      await this.fail(lease, `no remote handler for task '${lease.job.task_name}'`, {
-        retryable: false,
-      }).catch(() => {});
-      return;
-    }
-    // Heartbeat at half the lease interval. A non-running status (or a 409
-    // lost-lease) means the server owns the outcome: abort the handler so it
-    // can stop, and report nothing.
+  ): InFlightJob {
+    // A non-running heartbeat status (or a 409 lost-lease) means the server
+    // owns the outcome: abort the handler so it can stop, and report nothing.
     const lost = new AbortController();
-    const ticker = setInterval(() => {
-      void this.heartbeat(lease, leaseSecs)
-        .then((status) => {
-          if (status !== "running") lost.abort();
-        })
-        .catch((err: unknown) => {
-          if ((err as { status?: number }).status === 409) lost.abort();
-        });
-    }, Math.max(1, leaseSecs / 2) * 1_000);
+    let ticker: ReturnType<typeof setInterval> | undefined;
+    const stopHeartbeat = () => {
+      if (ticker !== undefined) clearInterval(ticker);
+      ticker = undefined;
+    };
+    const giveUp = (reason: Error) => {
+      stopHeartbeat();
+      if (!lost.signal.aborted) lost.abort(reason);
+    };
 
-    // Handler outcome and outcome *reporting* are separate concerns: a
-    // reporting error must never be re-reported as a job failure (that would
-    // burn retry budget on a transport blip and drop a successful result).
-    let outcome:
-      | { ok: true; result: JsonObject }
-      | { ok: false; error: string; retryable: boolean };
-    try {
-      outcome = { ok: true, result: await handler(lease.job, { signal: lost.signal }) };
-    } catch (err) {
-      outcome = {
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-        // NonRetryableError (or any error carrying `retryable: false`) sends
-        // the job straight to the dead-letter queue.
-        retryable: (err as { retryable?: boolean } | null)?.retryable !== false,
-      };
-    } finally {
-      clearInterval(ticker);
-    }
-    if (lost.signal.aborted) return; // the server owns the outcome
+    const done = (async () => {
+      const handler = handlers[lease.job.task_name];
+      if (!handler) {
+        await this.fail(lease, `no remote handler for task '${lease.job.task_name}'`, {
+          retryable: false,
+        }).catch(() => {});
+        return;
+      }
+      // Heartbeat at half the lease interval, per job.
+      ticker = setInterval(() => {
+        void this.heartbeat(lease, leaseSecs)
+          .then((status) => {
+            if (status !== "running") giveUp(new Error(`job ${lease.job.id} is ${status}`));
+          })
+          .catch((err: unknown) => {
+            if ((err as { status?: number }).status === 409) {
+              giveUp(new Error(`lease on job ${lease.job.id} was lost`));
+            }
+          });
+      }, Math.max(1, leaseSecs / 2) * 1_000);
 
-    const report = outcome.ok
-      ? this.complete(lease, outcome.result)
-      : this.fail(lease, outcome.error, { retryable: outcome.retryable });
-    await report.catch((err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(
-        `[queueflow] failed to report job ${lease.job.id} outcome; the lease will expire and the server redelivers: ${msg}`,
-      );
-    });
+      // Handler outcome and outcome *reporting* are separate concerns: a
+      // reporting error must never be re-reported as a job failure (that would
+      // burn retry budget on a transport blip and drop a successful result).
+      let outcome:
+        | { ok: true; result: JsonObject }
+        | { ok: false; error: string; retryable: boolean };
+      try {
+        outcome = { ok: true, result: await handler(lease.job, { signal: lost.signal }) };
+      } catch (err) {
+        outcome = {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+          // NonRetryableError (or any error carrying `retryable: false`) sends
+          // the job straight to the dead-letter queue.
+          retryable: (err as { retryable?: boolean } | null)?.retryable !== false,
+        };
+      } finally {
+        stopHeartbeat();
+      }
+      if (lost.signal.aborted) return; // the server owns the outcome
+
+      const report = outcome.ok
+        ? this.complete(lease, outcome.result)
+        : this.fail(lease, outcome.error, { retryable: outcome.retryable });
+      await report.catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(
+          `[queueflow] failed to report job ${lease.job.id} outcome; the lease will expire and the server redelivers: ${msg}`,
+        );
+      });
+    })();
+
+    return {
+      lease,
+      done,
+      abandon: () => giveUp(new Error(`worker stopped before job ${lease.job.id} finished`)),
+    };
   }
+}
+
+/** Options for {@link WorkerResource.run}. */
+export interface WorkerRunOptions {
+  /** Lease duration per job, in seconds (default 30). Heartbeats extend it. */
+  leaseSecs?: number;
+  /** Long-poll wait when the queue is empty, in seconds (default 20). */
+  waitSecs?: number;
+  /** Maximum handlers running at once (default 1). */
+  concurrency?: number;
+  /**
+   * Stop signal. Aborting it cancels the in-flight long poll immediately,
+   * then in-flight handlers are drained for up to `drainTimeoutMs`.
+   */
+  signal?: AbortSignal;
+  /**
+   * How long to wait for in-flight handlers after `signal` aborts (default
+   * 30_000). Handlers still running afterwards are abandoned: their
+   * `ctx.signal` aborts and they are reported in {@link WorkerRunResult}.
+   */
+  drainTimeoutMs?: number;
+  /** Called on transient lease errors (default: throttled console.warn). */
+  onError?: (error: Error) => void;
+}
+
+/** What {@link WorkerResource.run} resolves with once the worker has stopped. */
+export interface WorkerRunResult {
+  /**
+   * Jobs whose handlers were still running when `drainTimeoutMs` elapsed.
+   * Nothing was reported for them: their leases expire and the server
+   * redelivers. Empty when every in-flight handler finished in time.
+   */
+  unfinished: Job[];
+}
+
+/** A leased job whose handler is running. */
+interface InFlightJob {
+  lease: LeasedJob;
+  /** Settles when the handler has run and the outcome is reported. Never rejects. */
+  done: Promise<void>;
+  /** Stop heartbeating and abort `ctx.signal`; nothing is reported afterwards. */
+  abandon: () => void;
+}
+
+/**
+ * Wait up to `timeoutMs` for every in-flight handler to finish. Handlers
+ * still running afterwards are abandoned; their jobs are returned.
+ */
+async function drain(inFlight: Set<InFlightJob>, timeoutMs: number): Promise<Job[]> {
+  if (inFlight.size === 0) return [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const finished = Promise.all([...inFlight].map((j) => j.done)).then(() => false);
+  const expired = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(true), Math.max(0, timeoutMs));
+  });
+  const timedOut = await Promise.race([finished, expired]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (!timedOut) return [];
+  const left = [...inFlight];
+  for (const job of left) job.abandon();
+  return left.map((job) => job.lease.job);
 }
 
 /** Per-job context handed to worker handlers. */
@@ -769,6 +923,18 @@ export class SystemResource {
     });
     return res.tasks;
   }
+
+  /**
+   * Live backlog per queue (`GET /api/v1/queues`): claimable `pending`,
+   * future-dated `scheduled`, and `running` counts, plus how long the oldest
+   * claimable job has waited. Queues with no non-terminal jobs are omitted.
+   */
+  async queues(): Promise<QueueStats[]> {
+    const res = await this.t.call("listQueues", (init) => this.api.listQueues(init), {
+      idempotent: true,
+    });
+    return res.queues;
+  }
 }
 
 /**
@@ -867,11 +1033,16 @@ async function poll<T>(
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
+    if (signal?.aborted) return resolve();
+    const onAbort = () => {
       clearTimeout(timer);
       resolve();
-    }, { once: true });
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 

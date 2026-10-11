@@ -30,6 +30,8 @@ export * from './ListJobsResponse';
 export * from './ListWorkflowsResponse';
 export * from './OnFailure';
 export * from './OnSuccess';
+export * from './QueueStats';
+export * from './QueuesResponse';
 export * from './ReadyStatus';
 export * from './ReplayDeadLetterResponse';
 export * from './StatsSnapshot';

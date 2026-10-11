@@ -354,3 +354,294 @@ test("list filters left unset are not sent as query parameters", async () => {
   const url = new URL(calls[0].url);
   assert.equal([...url.searchParams.keys()].length, 0, url.search);
 });
+
+// --- worker runtime --------------------------------------------------------
+
+const leasedJob = (id, task = "work") => ({
+  ...JOB_FIXTURE,
+  id,
+  task_name: task,
+  status: "running",
+  payload: { id },
+});
+
+/**
+ * A fetch stub that speaks the worker protocol: leases hand out `jobs` in
+ * order (at most `max_jobs` per call), an empty queue long-polls until the
+ * request's abort signal fires (or `wait_secs` elapses), heartbeats answer
+ * with `heartbeat` (a status string, or an HTTP status number for an error),
+ * and complete/fail are recorded.
+ */
+function workerServer(jobs, { heartbeat = "running" } = {}) {
+  const pending = [...jobs];
+  const seen = { leases: [], heartbeats: 0, completes: [], fails: [] };
+  const fetchImpl = async (input, init) => {
+    const url = new URL(typeof input === "string" ? input : input.url);
+    const body = init?.body ? JSON.parse(init.body) : {};
+    if (url.pathname.endsWith("/lease")) {
+      seen.leases.push(body);
+      const take = Math.min(body.max_jobs ?? 1, pending.length);
+      const leased = pending.splice(0, take).map((job) => ({ job, lease_token: `tok-${job.id}` }));
+      if (leased.length === 0) {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(resolve, (body.wait_secs ?? 0) * 1_000);
+          init?.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              reject(new DOMException("The operation was aborted", "AbortError"));
+            },
+            { once: true },
+          );
+        });
+      }
+      return jsonResponse({ jobs: leased });
+    }
+    if (url.pathname.endsWith("/heartbeat")) {
+      seen.heartbeats += 1;
+      return typeof heartbeat === "number"
+        ? jsonResponse({ error: "lease lost" }, heartbeat)
+        : jsonResponse({ status: heartbeat });
+    }
+    if (url.pathname.endsWith("/complete")) {
+      seen.completes.push({ id: url.pathname.split("/").at(-2), ...body });
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname.endsWith("/fail")) {
+      seen.fails.push({ id: url.pathname.split("/").at(-2), ...body });
+      return new Response(null, { status: 204 });
+    }
+    if (url.pathname === "/api/v1/queues") {
+      return jsonResponse({
+        queues: [{ queue: "default", pending: 2, scheduled: 1, running: 1, oldest_pending_age_secs: 7 }],
+      });
+    }
+    throw new Error(`unexpected request ${init?.method ?? "GET"} ${url.pathname}`);
+  };
+  const qf = new QueueFlow({
+    baseUrl: "http://qf.test",
+    token: "tenant",
+    workerToken: "worker",
+    fetch: fetchImpl,
+    maxRetries: 0,
+  });
+  return { qf, seen };
+}
+
+/** Resolve once `predicate()` holds (polled every ms), or fail after 5s. */
+async function until(predicate, what) {
+  const deadline = Date.now() + 5_000;
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 1));
+  }
+}
+
+test("worker.run with concurrency runs handlers in parallel and never exceeds the cap", async () => {
+  const { qf, seen } = workerServer(["a", "b", "c", "d", "e"].map((id) => leasedJob(id)));
+  const controller = new AbortController();
+  let active = 0;
+  let maxActive = 0;
+  const started = [];
+  const release = new Map();
+  const handled = [];
+
+  const worker = qf.worker.run(
+    "q",
+    {
+      work: async (job) => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        started.push(job.id);
+        await new Promise((resolve) => release.set(job.id, resolve));
+        active -= 1;
+        handled.push(job.id);
+        return { done: job.id };
+      },
+    },
+    { concurrency: 2, waitSecs: 20, leaseSecs: 30, signal: controller.signal },
+  );
+
+  // Two slots fill from a single lease asking for exactly two jobs...
+  await until(() => started.length === 2, "two handlers to start");
+  assert.deepEqual(seen.leases, [{ max_jobs: 2, lease_secs: 30, wait_secs: 20 }]);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(started.length, 2, "a third handler must not start while both slots are busy");
+  assert.equal(seen.leases.length, 1, "no lease is issued while every slot is busy");
+
+  // ...and finishing one frees exactly one slot, leased with max_jobs: 1.
+  release.get("a")();
+  await until(() => started.length === 3, "a third handler to start");
+  assert.equal(seen.leases.at(-1).max_jobs, 1);
+  assert.equal(active, 2);
+
+  for (const id of ["b", "c", "d", "e"]) {
+    await until(() => release.has(id), `job ${id} to start`);
+    release.get(id)();
+  }
+  await until(() => seen.completes.length === 5, "all completes");
+  controller.abort();
+  const result = await worker;
+
+  assert.equal(maxActive, 2, "concurrency cap exceeded");
+  assert.deepEqual(result, { unfinished: [] });
+  assert.deepEqual(handled.sort(), ["a", "b", "c", "d", "e"]);
+  assert.deepEqual(
+    seen.completes.map((c) => c.result).sort((x, y) => x.done.localeCompare(y.done)),
+    ["a", "b", "c", "d", "e"].map((id) => ({ done: id })),
+  );
+  assert.equal(seen.fails.length, 0);
+});
+
+test("worker.run defaults to concurrency 1", async () => {
+  const { qf, seen } = workerServer([leasedJob("a")]);
+  const controller = new AbortController();
+  const worker = qf.worker.run("q", { work: async () => ({}) }, {
+    waitSecs: 20,
+    signal: controller.signal,
+  });
+  await until(() => seen.completes.length === 1, "the job to complete");
+  controller.abort();
+  await worker;
+  assert.equal(seen.leases[0].max_jobs, 1);
+});
+
+test("worker.run stops immediately during a long poll instead of waiting out waitSecs", async () => {
+  const { qf, seen } = workerServer([]);
+  const controller = new AbortController();
+  const worker = qf.worker.run("q", {}, { waitSecs: 20, signal: controller.signal });
+
+  await until(() => seen.leases.length === 1, "the long poll to start");
+  const t0 = Date.now();
+  controller.abort();
+  const result = await worker;
+
+  assert.ok(Date.now() - t0 < 1_000, "stop must not wait for the 20s long poll");
+  assert.deepEqual(result, { unfinished: [] });
+  assert.equal(seen.leases.length, 1, "no further lease after stop");
+});
+
+test("worker.run resolves at once when the signal is already aborted", async () => {
+  const { qf, seen } = workerServer([leasedJob("a")]);
+  const result = await qf.worker.run("q", { work: async () => ({}) }, {
+    signal: AbortSignal.abort(),
+  });
+  assert.deepEqual(result, { unfinished: [] });
+  assert.equal(seen.leases.length, 0);
+});
+
+test("worker.run drains in-flight handlers after stop and reports their outcomes", async () => {
+  const { qf, seen } = workerServer([leasedJob("a")]);
+  const controller = new AbortController();
+  let finish;
+  const worker = qf.worker.run(
+    "q",
+    {
+      work: async () => {
+        await new Promise((resolve) => (finish = resolve));
+        return { ok: true };
+      },
+    },
+    { waitSecs: 20, signal: controller.signal, drainTimeoutMs: 5_000 },
+  );
+
+  await until(() => finish !== undefined, "the handler to start");
+  controller.abort();
+  // The worker is draining; the handler finishes well inside the window.
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(seen.completes.length, 0, "the handler has not finished yet");
+  finish();
+  const result = await worker;
+
+  assert.deepEqual(result.unfinished, []);
+  assert.equal(seen.completes.length, 1);
+  assert.deepEqual(seen.completes[0].result, { ok: true });
+});
+
+test("worker.run gives up on handlers that outlive drainTimeoutMs and reports them", async () => {
+  const { qf, seen } = workerServer([leasedJob("slow"), leasedJob("quick")]);
+  const controller = new AbortController();
+  let slowSignal;
+  const worker = qf.worker.run(
+    "q",
+    {
+      work: async (job, ctx) => {
+        if (job.id === "quick") return { quick: true };
+        slowSignal = ctx.signal;
+        // Never finishes on its own; only stops when told to.
+        await new Promise((resolve) => ctx.signal.addEventListener("abort", resolve, { once: true }));
+        return { should: "not be reported" };
+      },
+    },
+    { concurrency: 2, waitSecs: 20, signal: controller.signal, drainTimeoutMs: 50 },
+  );
+
+  await until(() => seen.completes.length === 1 && slowSignal !== undefined, "quick to finish");
+  const t0 = Date.now();
+  controller.abort();
+  const result = await worker;
+
+  assert.ok(Date.now() - t0 < 2_000, "drain must give up after drainTimeoutMs");
+  assert.equal(result.unfinished.length, 1);
+  assert.equal(result.unfinished[0].id, "slow");
+  assert.ok(slowSignal.aborted, "an abandoned handler's ctx.signal must abort");
+  // Give the abandoned handler a tick to return: its outcome must not be reported.
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(seen.completes.length, 1);
+  assert.equal(seen.fails.length, 0);
+});
+
+test("worker.run aborts the handler and reports nothing when a heartbeat shows the lease was lost", async () => {
+  for (const heartbeat of ["cancelled", 409]) {
+    const { qf, seen } = workerServer([leasedJob("a")], { heartbeat });
+    const controller = new AbortController();
+    let aborted = false;
+    const worker = qf.worker.run(
+      "q",
+      {
+        work: async (job, ctx) => {
+          // leaseSecs 2 => a heartbeat after 1s, which reports the lease lost.
+          await new Promise((resolve) => ctx.signal.addEventListener("abort", resolve, { once: true }));
+          aborted = true;
+          return { late: true };
+        },
+      },
+      { leaseSecs: 2, waitSecs: 20, signal: controller.signal },
+    );
+
+    await until(() => aborted, `lost lease (${heartbeat}) to abort the handler`);
+    controller.abort();
+    const result = await worker;
+
+    assert.deepEqual(result.unfinished, [], `heartbeat=${heartbeat}`);
+    assert.ok(seen.heartbeats >= 1, `heartbeat=${heartbeat}: expected a heartbeat`);
+    assert.equal(seen.completes.length, 0, `heartbeat=${heartbeat}: the server owns the outcome`);
+    assert.equal(seen.fails.length, 0, `heartbeat=${heartbeat}`);
+  }
+});
+
+test("worker.run keeps a heartbeat per in-flight job", async () => {
+  const { qf, seen } = workerServer([leasedJob("a"), leasedJob("b")]);
+  const controller = new AbortController();
+  const release = [];
+  const worker = qf.worker.run(
+    "q",
+    { work: () => new Promise((resolve) => release.push(() => resolve({}))) },
+    { concurrency: 2, leaseSecs: 2, waitSecs: 20, signal: controller.signal },
+  );
+  await until(() => release.length === 2, "both handlers to start");
+  // One tick (1s) with two jobs in flight => two heartbeats.
+  await until(() => seen.heartbeats >= 2, "two heartbeats");
+  for (const r of release) r();
+  controller.abort();
+  await worker;
+  assert.equal(seen.completes.length, 2);
+});
+
+test("system.queues returns the per-queue backlog", async () => {
+  const { qf } = workerServer([]);
+  const queues = await qf.system.queues();
+  assert.deepEqual(queues, [
+    { queue: "default", pending: 2, scheduled: 1, running: 1, oldest_pending_age_secs: 7 },
+  ]);
+});

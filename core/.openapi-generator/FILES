@@ -42,6 +42,8 @@ src/models/ListJobsResponse.ts
 src/models/ListWorkflowsResponse.ts
 src/models/OnFailure.ts
 src/models/OnSuccess.ts
+src/models/QueueStats.ts
+src/models/QueuesResponse.ts
 src/models/ReadyStatus.ts
 src/models/ReplayDeadLetterResponse.ts
 src/models/StatsSnapshot.ts

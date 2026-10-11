@@ -115,30 +115,63 @@ const dag = wf("order_123")
 ### System — `qf.system`
 
 ```ts
-await qf.system.stats();  // engine counters
-await qf.system.tasks();  // registered task handler names
+await qf.system.stats();   // engine counters
+await qf.system.tasks();   // registered task handler names
+await qf.system.queues();  // live per-queue backlog: pending, scheduled, running, oldest pending age
 ```
+
+`queues()` (`GET /api/v1/queues`) lists every queue that currently has non-terminal jobs, so
+you can decide whether to add workers; queues with nothing pending, scheduled or running are
+omitted.
 
 ### Worker — `qf.worker`
 
 Run task handlers in this process against a remote QueueFlow server:
 
 ```ts
-await qf.worker.run("default", {
-  "send-email": async (job, ctx) => {
-    // ctx.signal aborts if the job is cancelled mid-run or the lease is lost.
-    await sendEmail(job.payload);
-    return { sent: true };
+const controller = new AbortController();
+process.on("SIGTERM", () => controller.abort());
+
+const { unfinished } = await qf.worker.run(
+  "default",
+  {
+    "send-email": async (job, ctx) => {
+      // ctx.signal aborts if the job is cancelled mid-run, the lease is lost,
+      // or the worker gives up waiting for this handler while stopping.
+      await sendEmail(job.payload, { signal: ctx.signal });
+      return { sent: true };
+    },
   },
-});
+  { concurrency: 4, signal: controller.signal, drainTimeoutMs: 30_000 },
+);
 ```
 
-`run()` leases one job at a time, heartbeats at half the lease interval, stops
-reporting when the lease is lost, and applies the server's retry policy on
-errors. Delivery is at-least-once — make handlers idempotent. Configure the
+Options (all optional):
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `concurrency` | `1` | Handlers running at once. Each lease asks for as many jobs as there are free slots; no lease is issued while every slot is busy. |
+| `leaseSecs` | `30` | Lease duration per job. Every in-flight job is heartbeated at half this interval. |
+| `waitSecs` | `20` | Long-poll wait when the queue is empty. |
+| `signal` | none | Stop signal (see below). |
+| `drainTimeoutMs` | `30000` | How long to wait for in-flight handlers after `signal` aborts. |
+| `onError` | throttled `console.warn` | Called on transient lease errors (network, 5xx). |
+
+Stop and drain: aborting `signal` cancels the in-flight long poll immediately,
+so stopping never waits out `waitSecs`. Handlers already running get up to
+`drainTimeoutMs` to finish and report their outcome. Any handler still running
+after that has its `ctx.signal` aborted and is left unreported: its lease
+expires and the server redelivers the job. `run()` resolves once the drain is
+over, with `unfinished` listing those abandoned jobs (empty when everything
+finished in time).
+
+The runtime heartbeats each job at half the lease interval, stops reporting
+when a heartbeat shows the lease was lost (the job is no longer `running`, or
+the server answers 409), and leaves retries, backoff and dead-lettering to the
+server. Delivery is at-least-once, so make handlers idempotent. Configure the
 server's `--worker-token` and pass it as `workerToken`; `run()` throws on
 401/403 rather than spinning. Lower-level calls (`lease`, `heartbeat`,
-`complete`, `fail`) are also exposed.
+`complete`, `fail`) are also exposed; `lease()` accepts a `signal` too.
 
 ### Cron — `qf.cron`
 
