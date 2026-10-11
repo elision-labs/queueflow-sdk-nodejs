@@ -39,7 +39,7 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsup",
-    "test": "npm run build && node --test \"test/**/*.test.mjs\"",
+    "test": "npm run build && node --test test/*.test.mjs",
     "test:live": "npm run build && node --test test/live.mjs",
     "typecheck": "tsc -p tsconfig.json",
     "generate-core": "./scripts/generate-core.sh",
