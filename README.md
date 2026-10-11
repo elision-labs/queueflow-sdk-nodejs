@@ -97,6 +97,7 @@ List responses carry `next_cursor` when there are more pages; pass it back as
 | `create(builderOrBody)` | Create a workflow from a `wf()` builder or a raw request. |
 | `get(id)` · `list(opts?)` · `cancel(id)` | Fetch / list / cancel. |
 | `diagram(id)` | Mermaid (`graph TD`) diagram of the DAG. |
+| `steps(id)` | Runtime state of every step (name, status, job id). |
 | `waitFor(id, opts?)` | Poll until a terminal workflow state. |
 
 ### Workflow builder — `wf()`
