@@ -65,10 +65,10 @@ export interface StepCondition {
     path?: string | null;
     /**
      * 
-     * @type {object}
+     * @type {any}
      * @memberof StepCondition
      */
-    value?: object | null;
+    value?: any | null;
 }
 
 
