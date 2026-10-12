@@ -16,7 +16,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { QueueFlow, wf, NotFoundError, BadRequestError } from "../dist/index.js";
+import { QueueFlow, wf, NotFoundError, BadRequestError, ConflictError, NonRetryableError } from "../dist/index.js";
 
 const URL_ = process.env.QUEUEFLOW_URL;
 const TOKEN = process.env.QUEUEFLOW_TOKEN ?? "dev";
@@ -351,4 +351,269 @@ test("live: dead-letter filters and bulk replay on a dedicated queue", { skip },
     // The replayed job is pending on a queue nobody polls; do not leave it behind.
     await qf.jobs.cancelMany({ queue }).catch(() => {});
   }
+});
+
+// --- server 0.6.0: workflows v2 -------------------------------------------
+//
+// Every step below names this run's own queue, and this run's own worker is
+// the only one polling it, so the shared server's in-process handlers never
+// see these jobs. Each test starts a worker with just the handlers it needs
+// and stops it before returning.
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Run `fn` while a worker with `handlers` polls `queue`; stop it afterwards. */
+async function withWorker(queue, handlers, fn) {
+  const controller = new AbortController();
+  const worker = qf.worker.run(queue, handlers, {
+    concurrency: 4,
+    leaseSecs: 10,
+    waitSecs: 2,
+    signal: controller.signal,
+  });
+  try {
+    return await fn();
+  } finally {
+    controller.abort();
+    const result = await worker;
+    assert.deepEqual(result.unfinished, [], "worker stopped with jobs still in flight");
+  }
+}
+
+/** The handler's view of the workflow context, minus the injected key itself. */
+const contextOf = (job) => job.payload._context ?? {};
+
+test("live: a false `when` skips the step with `condition not met` and its dependents still run", { skip }, async () => {
+  const queue = `node-live-${suffix}-cond`;
+  const task = `node-live-cond-task-${suffix}`;
+  const seen = [];
+
+  await withWorker(queue, {
+    [task]: async (job) => {
+      seen.push(job.payload.step);
+      return { step: job.payload.step, upstream: Object.keys(contextOf(job)).sort() };
+    },
+  }, async () => {
+    const workflow = await qf.workflows.create(
+      wf(`node-live-cond-${suffix}`)
+        .step("validate", task, { queue, payload: { step: "validate", total: 5 } })
+        .step("review", task, {
+          queue,
+          after: ["validate"],
+          payload: { step: "review" },
+          when: { path: "validate.total", op: "gt", value: 100 },
+        })
+        .step("confirm", task, { queue, after: ["validate", "review"], payload: { step: "confirm" } }),
+    );
+    assert.equal(workflow.steps[1].when.op, "gt");
+    assert.equal(workflow.steps[0].queue, queue);
+
+    // Follow the run over SSE while it completes; the stream must end on its own.
+    const events = [];
+    for await (const event of qf.workflows.watch(workflow.id)) events.push(event);
+    assert.ok(events.length >= 1, "at least the current state is streamed");
+    for (const event of events) assert.equal(event.workflow_id, workflow.id);
+    const last = events[events.length - 1];
+    assert.equal(last.status, "completed", `error: ${last.error_message}`);
+    assert.deepEqual(last.steps.map((s) => s.name), ["validate", "review", "confirm"]);
+
+    const finished = await qf.workflows.waitFor(workflow.id, WAIT);
+    assert.equal(finished.status, "completed", `error: ${finished.error_message}`);
+    assert.deepEqual(seen.sort(), ["confirm", "validate"], "the skipped step never ran");
+    // The dependent ran without a result for the skipped step in its context.
+    assert.deepEqual(finished.context.confirm.upstream, ["validate"]);
+    assert.equal(finished.context.review, undefined);
+
+    const steps = await qf.workflows.steps(workflow.id);
+    const byName = Object.fromEntries(steps.map((s) => [s.name, s]));
+    assert.equal(byName.validate.status, "completed");
+    assert.equal(byName.review.status, "skipped");
+    assert.equal(byName.review.error, "condition not met");
+    assert.equal(byName.review.job_id ?? undefined, undefined, "a condition-skipped step has no job");
+    assert.equal(byName.confirm.status, "completed");
+    for (const name of ["validate", "confirm"]) {
+      assert.ok(byName[name].started_at instanceof Date, `${name}.started_at`);
+      assert.ok(byName[name].completed_at instanceof Date, `${name}.completed_at`);
+      assert.equal(typeof byName[name].job_id, "string", `${name}.job_id`);
+    }
+  });
+});
+
+test("live: a fan-out runs one child per element and collects results in element order", { skip }, async () => {
+  const queue = `node-live-${suffix}-fan`;
+  const square = `node-live-square-${suffix}`;
+  const sum = `node-live-sum-${suffix}`;
+  const items = [1, 2, 3, 4];
+
+  await withWorker(queue, {
+    [square]: async (job) => {
+      // Finish in reverse order so element order cannot be completion order.
+      await sleep((items.length - job.payload._index) * 150);
+      return { sq: job.payload.n * job.payload.n, index: job.payload._index };
+    },
+    [sum]: async (job) => ({
+      total: contextOf(job).square.results.reduce((acc, r) => acc + r.sq, 0),
+    }),
+  }, async () => {
+    const workflow = await qf.workflows.create(
+      wf(`node-live-fan-${suffix}`)
+        .context({ items })
+        .step("square", square, { queue, fanOut: { path: "items", itemKey: "n" } })
+        .step("sum", sum, { queue, after: ["square"] }),
+    );
+    assert.equal(workflow.steps[0].fan_out.path, "items");
+    assert.equal(workflow.steps[0].fan_out.item_key, "n");
+
+    const finished = await qf.workflows.waitFor(workflow.id, WAIT);
+    assert.equal(finished.status, "completed", `error: ${finished.error_message}`);
+    assert.deepEqual(
+      finished.context.square,
+      { results: items.map((n, index) => ({ sq: n * n, index })) },
+    );
+    assert.equal(finished.context.sum.total, 30);
+
+    const steps = await qf.workflows.steps(workflow.id);
+    const fan = steps.find((s) => s.name === "square");
+    assert.equal(fan.status, "completed");
+    assert.deepEqual(fan.fan_out, { total: items.length, completed: items.length, failed: 0 });
+    assert.equal(typeof fan.job_id, "string", "job_id points at the first child");
+    assert.equal(steps.find((s) => s.name === "sum").fan_out ?? undefined, undefined);
+
+    // Every child is an ordinary job on this run's queue, tagged with its position.
+    const children = await qf.jobs.list({ queue, taskName: square, limit: 50 });
+    assert.equal(children.jobs.length, items.length);
+    const positions = children.jobs.map((j) => j.metadata.fan_out_index).sort();
+    assert.deepEqual(positions, [0, 1, 2, 3]);
+    for (const job of children.jobs) {
+      assert.equal(job.metadata.fan_out_total, items.length);
+      assert.equal(job.workflow_id, workflow.id);
+      assert.equal(job.status, "completed");
+    }
+    assert.ok(children.jobs.some((j) => j.id === fan.job_id));
+  });
+});
+
+test("live: a sub-workflow step spawns a child workflow linked to its parent", { skip }, async () => {
+  const queue = `node-live-${suffix}-sub`;
+  const charge = `node-live-charge-${suffix}`;
+  const pick = `node-live-pick-${suffix}`;
+  const pack = `node-live-pack-${suffix}`;
+  const done = `node-live-done-${suffix}`;
+
+  await withWorker(queue, {
+    [charge]: async (job) => ({ charge_id: `ch_${job.payload.amount}` }),
+    [pick]: async (job) => {
+      const ctx = contextOf(job);
+      // The child's context: its own context, the step payload, the parent under `_parent`.
+      return { picked: true, warehouse: ctx.warehouse, label: ctx.label, parent_charge: ctx._parent.charge.charge_id };
+    },
+    [pack]: async (job) => ({ packed: contextOf(job).pick.picked === true }),
+    [done]: async (job) => ({ shipped: contextOf(job).fulfil.pack.packed === true }),
+  }, async () => {
+    const child = wf("fulfilment")
+      .context({ label: "express" })
+      .step("pick", pick, { queue })
+      .step("pack", pack, { queue, after: ["pick"] })
+      .timeout(600);
+    const workflow = await qf.workflows.create(
+      wf(`node-live-sub-${suffix}`)
+        .step("charge", charge, { queue, payload: { amount: 7 } })
+        .subWorkflow("fulfil", child, { after: ["charge"], payload: { warehouse: "eu-1" } })
+        .step("done", done, { queue, after: ["fulfil"] })
+        .timeout(900),
+    );
+    assert.equal(workflow.timeout_secs, 900);
+    assert.ok(workflow.deadline_at instanceof Date);
+    // Server 0.6.0 stores a sub-workflow step's task_name as "" rather than omitting it.
+    assert.ok(!workflow.steps[1].task_name, `unexpected task_name ${JSON.stringify(workflow.steps[1].task_name)}`);
+    assert.equal(workflow.steps[1].workflow.name, "fulfilment");
+    assert.equal(workflow.parent_workflow_id ?? undefined, undefined);
+
+    const finished = await qf.workflows.waitFor(workflow.id, WAIT);
+    assert.equal(finished.status, "completed", `error: ${finished.error_message}`);
+    // The step's result is the child's final context.
+    assert.equal(finished.context.fulfil.pick.picked, true);
+    assert.equal(finished.context.fulfil.pick.warehouse, "eu-1");
+    assert.equal(finished.context.fulfil.pick.label, "express");
+    assert.equal(finished.context.fulfil.pick.parent_charge, "ch_7");
+    assert.equal(finished.context.fulfil.pack.packed, true);
+    assert.equal(finished.context.done.shipped, true);
+
+    const steps = await qf.workflows.steps(workflow.id);
+    const fulfil = steps.find((s) => s.name === "fulfil");
+    assert.equal(fulfil.status, "completed");
+    assert.equal(typeof fulfil.child_workflow_id, "string");
+
+    const childRun = await qf.workflows.get(fulfil.child_workflow_id);
+    assert.equal(childRun.name, "fulfilment");
+    assert.equal(childRun.status, "completed");
+    assert.equal(childRun.parent_workflow_id, workflow.id);
+    assert.equal(childRun.parent_step_name, "fulfil");
+    assert.equal(childRun.timeout_secs, 600);
+    assert.equal(childRun.context._parent.charge.charge_id, "ch_7");
+    const childSteps = await qf.workflows.steps(childRun.id);
+    assert.deepEqual(childSteps.map((s) => [s.name, s.status]), [["pick", "completed"], ["pack", "completed"]]);
+  });
+});
+
+test("live: retry re-runs the failed step and its cancelled dependents, keeping completed ones", { skip }, async () => {
+  const queue = `node-live-${suffix}-retry`;
+  const first = `node-live-first-${suffix}`;
+  const flaky = `node-live-flaky-${suffix}`;
+  const last = `node-live-last-${suffix}`;
+  let failNext = true;
+  const runs = { first: 0, flaky: 0, last: 0 };
+
+  await withWorker(queue, {
+    [first]: async () => ({ n: ++runs.first }),
+    [flaky]: async () => {
+      runs.flaky += 1;
+      if (failNext) throw new NonRetryableError("live test: fail once");
+      return { n: runs.flaky };
+    },
+    [last]: async () => ({ n: ++runs.last }),
+  }, async () => {
+    const workflow = await qf.workflows.create(
+      wf(`node-live-retry-${suffix}`)
+        .step("first", first, { queue })
+        .step("flaky", flaky, { queue, after: ["first"] })
+        .step("last", last, { queue, after: ["flaky"] })
+        .timeout(600),
+    );
+    assert.equal(workflow.retry_count, 0);
+
+    const failed = await qf.workflows.waitFor(workflow.id, WAIT);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error_message, /fail once/);
+    const before = Object.fromEntries((await qf.workflows.steps(workflow.id)).map((s) => [s.name, s]));
+    assert.equal(before.first.status, "completed");
+    assert.equal(before.flaky.status, "failed");
+    assert.match(before.flaky.error, /fail once/);
+    assert.equal(before.last.status, "cancelled");
+    assert.equal(before.last.job_id ?? undefined, undefined, "a halted dependent never got a job");
+    assert.deepEqual(runs, { first: 1, flaky: 1, last: 0 });
+
+    failNext = false;
+    await qf.workflows.retry(workflow.id);
+
+    const finished = await qf.workflows.waitFor(workflow.id, WAIT);
+    assert.equal(finished.status, "completed", `error: ${finished.error_message}`);
+    assert.equal(finished.retry_count, 1);
+    assert.equal(finished.error_message ?? undefined, undefined, "a retry clears the error");
+    assert.ok(finished.deadline_at instanceof Date);
+    assert.ok(finished.deadline_at > failed.deadline_at, "the deadline is re-armed");
+    // The completed step kept its result and did not run again.
+    assert.deepEqual(runs, { first: 1, flaky: 2, last: 1 });
+    assert.deepEqual(finished.context, { first: { n: 1 }, flaky: { n: 2 }, last: { n: 1 } });
+
+    const after = Object.fromEntries((await qf.workflows.steps(workflow.id)).map((s) => [s.name, s]));
+    for (const name of ["first", "flaky", "last"]) assert.equal(after[name].status, "completed", name);
+    assert.equal(after.first.job_id, before.first.job_id, "completed steps keep their job");
+    assert.notEqual(after.flaky.job_id, before.flaky.job_id, "the failed step got a fresh job");
+    assert.equal(after.flaky.error ?? undefined, undefined);
+    assert.equal(typeof after.last.job_id, "string");
+
+    // Retrying a workflow that is not failed, partially failed or cancelled is a 409.
+    await assert.rejects(() => qf.workflows.retry(workflow.id), ConflictError);
+  });
 });

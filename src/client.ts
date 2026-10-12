@@ -2,7 +2,7 @@
  * The ergonomic QueueFlow client and its resource groups.
  *
  * This layer is hand-written: camelCase inputs, `create()` = enqueue+fetch,
- * `waitFor()` polling, the `watch()` SSE stream, idempotent-retry transport
+ * `waitFor()` polling, the `watch()` SSE streams, idempotent-retry transport
  * policy, the worker run-loop, and typed errors. The wire types, the per-tag
  * API classes, and all (de)serialization come from the generated `../core`
  * and are never hand-edited.
@@ -16,7 +16,7 @@ import { SystemApi } from "../core/src/apis/SystemApi";
 import { CronApi } from "../core/src/apis/CronApi";
 import { DlqApi } from "../core/src/apis/DlqApi";
 import { HealthApi } from "../core/src/apis/HealthApi";
-import { JobFromJSON } from "../core/src/models/index";
+import { JobFromJSON, WorkflowEventFromJSON } from "../core/src/models/index";
 import type {
   BackoffStrategy,
   Job,
@@ -29,6 +29,7 @@ import type {
   ListWorkflowsResponse,
   CreateWorkflowRequest,
   WorkflowDiagramResponse,
+  WorkflowEvent,
   WorkflowStepState,
   LeasedJob,
   StatsSnapshot,
@@ -287,6 +288,56 @@ class Transport {
     }
     throw last;
   }
+
+  /**
+   * Open a Server-Sent Events stream and yield the `data` of every `status`
+   * event, in order, until the server closes it or `signal` aborts. The
+   * generated client models these endpoints as a single JSON value, so the
+   * framing is hand-implemented here; callers decode each payload with the
+   * matching generated `FromJSON`.
+   */
+  async *sse(path: string, label: string, signal?: AbortSignal): AsyncGenerator<string> {
+    const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      method: "GET",
+      headers: { authorization: `Bearer ${this.token}`, accept: "text/event-stream" },
+      signal,
+    });
+    if (!res.ok || !res.body) {
+      throw await toQueueFlowError(new ResponseError(res), label);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let event = "message";
+    let data: string[] = [];
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let idx: number;
+        while ((idx = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, idx).replace(/\r$/, "");
+          buffer = buffer.slice(idx + 1);
+          if (line === "") {
+            if (data.length && event === "status") yield data.join("\n");
+            event = "message";
+            data = [];
+          } else if (line.startsWith("event:")) {
+            event = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            // Per the SSE spec, strip at most ONE leading space; further
+            // whitespace is payload.
+            let value = line.slice(5);
+            if (value.startsWith(" ")) value = value.slice(1);
+            data.push(value);
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+  }
 }
 
 
@@ -410,55 +461,16 @@ export class JobsResource {
    * `JobFromJSON` so the yielded shape matches `get()` exactly (dates included).
    */
   async *watch(id: string, opts: { signal?: AbortSignal } = {}): AsyncGenerator<Job> {
-    const url = `${this.t.baseUrl}/api/v1/jobs/${encodeURIComponent(id)}/events`;
-    const res = await this.t.fetchImpl(url, {
-      method: "GET",
-      headers: { authorization: `Bearer ${this.t.token}`, accept: "text/event-stream" },
-      signal: opts.signal,
-    });
-    if (!res.ok || !res.body) {
-      throw await toQueueFlowError(new ResponseError(res), "streamJobEvents");
-    }
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = "";
-    let event = "message";
-    let data: string[] = [];
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        let idx: number;
-        while ((idx = buffer.indexOf("\n")) >= 0) {
-          const line = buffer.slice(0, idx).replace(/\r$/, "");
-          buffer = buffer.slice(idx + 1);
-          if (line === "") {
-            if (data.length && event === "status") {
-              const job = JobFromJSON(JSON.parse(data.join("\n")));
-              yield job;
-              if (TERMINAL_JOB_STATUSES.has(job.status)) return;
-            }
-            event = "message";
-            data = [];
-          } else if (line.startsWith("event:")) {
-            event = line.slice(6).trim();
-          } else if (line.startsWith("data:")) {
-            // Per the SSE spec, strip at most ONE leading space; further
-            // whitespace is payload.
-            let value = line.slice(5);
-            if (value.startsWith(" ")) value = value.slice(1);
-            data.push(value);
-          }
-        }
-      }
-    } finally {
-      reader.releaseLock();
+    const path = `/api/v1/jobs/${encodeURIComponent(id)}/events`;
+    for await (const data of this.t.sse(path, "streamJobEvents", opts.signal)) {
+      const job = JobFromJSON(JSON.parse(data));
+      yield job;
+      if (TERMINAL_JOB_STATUSES.has(job.status)) return;
     }
   }
 }
 
-/** Workflow orchestration: create DAGs, fetch, list, cancel, diagram, wait. */
+/** Workflow orchestration: create DAGs, fetch, list, cancel, retry, diagram, steps, wait, watch. */
 export class WorkflowsResource {
   private readonly api: WorkflowsApi;
   constructor(private readonly t: Transport) {
@@ -506,6 +518,19 @@ export class WorkflowsResource {
     return this.t.call("cancelWorkflow", (init) => this.api.cancelWorkflow({ id }, init));
   }
 
+  /**
+   * Re-run a `failed`, `partially_failed` or `cancelled` workflow from where
+   * it stopped: every step that did not complete goes back to `pending` and
+   * is scheduled again as its dependencies allow; completed steps and
+   * condition-skipped steps keep their results. The workflow becomes
+   * `running`, its `error_message` clears, `retry_count` increments, and the
+   * deadline, if any, is re-armed. Retrying a running or completed workflow
+   * is a 409 {@link ConflictError}. Requires server 0.6.0.
+   */
+  retry(id: string): Promise<void> {
+    return this.t.call("retryWorkflow", (init) => this.api.retryWorkflow({ id }, init));
+  }
+
   /** Fetch the Mermaid (`graph TD`) diagram for a workflow's DAG. */
   diagram(id: string): Promise<WorkflowDiagramResponse> {
     return this.t.call(
@@ -518,7 +543,12 @@ export class WorkflowsResource {
   /**
    * Runtime status of every step, in declaration order — the live progress
    * view (`get()` returns the step *definitions* only). Each entry carries
-   * the step's status and, once scheduled, the id of the job executing it.
+   * the step's status and, once scheduled, the id of the job executing it
+   * (the first child, for a fan-out). Since server 0.6.0 it also carries
+   * `error` (why it failed, was skipped or cancelled; `condition not met` for
+   * a false `when`), `started_at`, `completed_at`, the `child_workflow_id` of
+   * a sub-workflow step, and `fan_out: { total, completed, failed }` for a
+   * fan-out step.
    */
   async steps(id: string): Promise<WorkflowStepState[]> {
     const res = await this.t.call(
@@ -538,6 +568,23 @@ export class WorkflowsResource {
       "workflow",
       opts,
     );
+  }
+
+  /**
+   * Stream a workflow's progress (SSE from `/api/v1/workflows/{id}/events`,
+   * server 0.6.0). Yields one {@link WorkflowEvent} (`workflow_id`, `status`,
+   * `error_message`, and every step's state as in {@link steps}) whenever the
+   * workflow or any step changes, starting with the current state, and ends
+   * after the terminal event. Each event is decoded with the generated
+   * `WorkflowEventFromJSON`, so dates are `Date`s.
+   */
+  async *watch(id: string, opts: { signal?: AbortSignal } = {}): AsyncGenerator<WorkflowEvent> {
+    const path = `/api/v1/workflows/${encodeURIComponent(id)}/events`;
+    for await (const data of this.t.sse(path, "streamWorkflowEvents", opts.signal)) {
+      const event = WorkflowEventFromJSON(JSON.parse(data));
+      yield event;
+      if (TERMINAL_WORKFLOW_STATUSES.has(event.status)) return;
+    }
   }
 }
 

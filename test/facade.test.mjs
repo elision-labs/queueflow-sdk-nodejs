@@ -19,6 +19,7 @@ import {
   WorkflowValidationError,
   ApiError,
   BadRequestError,
+  ConflictError,
   NotFoundError,
   TimeoutError,
   AbortError,
@@ -836,4 +837,238 @@ test("system.queues returns the per-queue backlog", async () => {
   assert.deepEqual(queues, [
     { queue: "default", pending: 2, scheduled: 1, running: 1, oldest_pending_age_secs: 7, paused: false },
   ]);
+});
+
+// --- server 0.6.0: workflows v2 -------------------------------------------
+
+test("WorkflowBuilder maps queue, when and fanOut onto the wire step", () => {
+  const when = {
+    any: [
+      { path: "fraud.score", op: "gt", value: 0.8 },
+      { all: [{ path: "validate.total_cents", op: "gte", value: 100000 }, { not: { path: "customer.trusted", value: true } }] },
+    ],
+  };
+  const req = wf("order")
+    .step("fetch", "fetch_images", { queue: "images" })
+    .step("resize", "resize_image", {
+      after: ["fetch"],
+      queue: "images",
+      fanOut: { path: "fetch.images", itemKey: "image", maxItems: 50 },
+      onFailure: "continue",
+    })
+    .step("review", "queue_for_review", { after: ["fetch"], when })
+    .step("exists", "notify", { when: { path: "fetch.flag" } })
+    .build();
+
+  assert.equal(req.steps[0].queue, "images");
+  assert.equal(req.steps[0].fan_out, undefined);
+  assert.equal(req.steps[0].when, undefined);
+  assert.deepEqual(req.steps[1].fan_out, { path: "fetch.images", item_key: "image", max_items: 50 });
+  assert.deepEqual(req.steps[2].when, when);
+  assert.deepEqual(req.steps[3].when, { path: "fetch.flag" });
+  // A fan-out with only a path carries no undefined keys that would serialize oddly.
+  const bare = wf("x").step("a", "t", { fanOut: { path: "ctx.items" } }).build();
+  assert.deepEqual(bare.steps[0].fan_out, { path: "ctx.items" });
+  assert.equal(req.timeout_secs, undefined);
+});
+
+test("WorkflowBuilder builds sub-workflow steps from a child builder or a raw body", () => {
+  const child = wf("fulfilment")
+    .step("pick", "pick_items")
+    .step("pack", "pack_parcel", { after: ["pick"] })
+    .timeout(1800);
+  const raw = { name: "notify", steps: [{ name: "mail", task_name: "send_mail" }] };
+
+  const req = wf("order")
+    .step("charge", "charge_payment")
+    .subWorkflow("fulfil", child, { after: ["charge"], payload: { warehouse: "eu-1" }, onFailure: "skip" })
+    .subWorkflow("notify", raw, { after: ["fulfil"], queue: "mail" })
+    .timeout(3600)
+    .build();
+
+  assert.equal(req.timeout_secs, 3600);
+  const fulfil = req.steps[1];
+  assert.equal(fulfil.task_name, undefined);
+  assert.deepEqual(fulfil.depends_on, ["charge"]);
+  assert.deepEqual(fulfil.payload, { warehouse: "eu-1" });
+  assert.equal(fulfil.on_failure, "skip");
+  assert.equal(fulfil.workflow.name, "fulfilment");
+  assert.equal(fulfil.workflow.timeout_secs, 1800);
+  assert.deepEqual(fulfil.workflow.steps.map((s) => s.name), ["pick", "pack"]);
+  assert.deepEqual(req.steps[2].workflow, raw);
+  assert.equal(req.steps[2].queue, "mail");
+
+  // The child builder stays editable until the parent is built.
+  child.step("label", "print_label", { after: ["pack"] });
+  const again = wf("order").subWorkflow("fulfil", child).build();
+  assert.equal(again.steps[0].workflow.steps.length, 3);
+
+  // The body round-trips through JSON without undefined-only keys appearing.
+  const json = JSON.parse(JSON.stringify(req));
+  assert.equal("task_name" in json.steps[1], false);
+});
+
+test("WorkflowBuilder rejects the 0.6.0 step-shape mistakes locally", () => {
+  const cases = [
+    ["empty task name", () => wf("x").step("a", "").build(), /needs a task name or a sub-workflow/],
+    [
+      "fan-out on a sub-workflow step",
+      () => wf("x").subWorkflow("a", { name: "c", steps: [{ name: "s", task_name: "t" }] }, { fanOut: { path: "p" } }).build(),
+      /cannot both fan out and run a sub-workflow/,
+    ],
+    ["fan-out without a path", () => wf("x").step("a", "t", { fanOut: { path: "" } }).build(), /fan_out needs a path/],
+    ["condition with nothing", () => wf("x").step("a", "t", { when: {} }).build(), /exactly one of path, all, any or not/],
+    [
+      "condition with two kinds",
+      () => wf("x").step("a", "t", { when: { path: "p", all: [] } }).build(),
+      /exactly one of path, all, any or not/,
+    ],
+    ["op without value", () => wf("x").step("a", "t", { when: { path: "p", op: "gt" } }).build(), /op gt needs a value/],
+    ["empty path", () => wf("x").step("a", "t", { when: { path: "" } }).build(), /path must not be empty/],
+    [
+      "op on a branch",
+      () => wf("x").step("a", "t", { when: { any: [{ path: "p" }], op: "eq" } }).build(),
+      /op and value belong on a leaf/,
+    ],
+    [
+      "nested bad leaf",
+      () => wf("x").step("a", "t", { when: { not: { all: [{ path: "p", op: "in" }] } } }).build(),
+      /op in needs a value/,
+    ],
+    [
+      "invalid child DAG surfaces from the parent build",
+      () => wf("x").subWorkflow("a", wf("c").step("s", "t", { after: ["ghost"] })).build(),
+      /depends on unknown step "ghost"/,
+    ],
+    ["zero timeout", () => wf("x").timeout(0), /timeout must be/],
+    ["fractional timeout", () => wf("x").timeout(1.5), /timeout must be/],
+    ["timeout over 30 days", () => wf("x").timeout(30 * 86400 + 1), /timeout must be/],
+  ];
+  for (const [name, build, pattern] of cases) {
+    assert.throws(build, pattern, `case: ${name}`);
+    assert.throws(build, WorkflowValidationError, `case: ${name} (wrong error type)`);
+  }
+  // Still allowed: `exists` without a value, `eq` by value alone, a sub-workflow with a condition.
+  wf("x").step("a", "t", { when: { path: "p", op: "exists" } }).build();
+  wf("x").step("a", "t", { when: { path: "p", value: null } }).build();
+  wf("x").subWorkflow("a", { name: "c", steps: [{ name: "s", task_name: "t" }] }, { when: { path: "p" } }).build();
+});
+
+test("workflows.create sends timeout_secs and the nested child workflow", async () => {
+  const { qf, calls } = clientWith([
+    jsonResponse({ workflow_id: "wf-1" }, 201),
+    jsonResponse({
+      id: "wf-1",
+      name: "order",
+      status: "running",
+      created_at: "2026-01-01T00:00:00Z",
+      steps: [],
+      timeout_secs: 60,
+      retry_count: 0,
+    }),
+  ]);
+  const workflow = await qf.workflows.create(
+    wf("order")
+      .step("a", "t", { queue: "q", when: { path: "p", value: 1 } })
+      .subWorkflow("b", wf("c").step("s", "t"), { after: ["a"] })
+      .timeout(60),
+  );
+  const body = JSON.parse(calls[0].body);
+  assert.equal(body.timeout_secs, 60);
+  assert.equal(body.steps[0].queue, "q");
+  assert.deepEqual(body.steps[0].when, { path: "p", value: 1 });
+  assert.equal(body.steps[1].task_name, undefined);
+  assert.deepEqual(body.steps[1].workflow, { name: "c", steps: [{ name: "s", task_name: "t" }] });
+  assert.equal(workflow.timeout_secs, 60);
+  assert.equal(workflow.retry_count, 0);
+});
+
+test("workflows.retry posts to the retry route and is not replayed", async () => {
+  const { qf, calls } = clientWith([new Response(null, { status: 204 })]);
+  await qf.workflows.retry("wf/1");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].method, "POST");
+  assert.ok(calls[0].url.endsWith("/api/v1/workflows/wf%2F1/retry"), calls[0].url);
+
+  const running = clientWith([jsonResponse({ error: "workflow is running" }, 409)]);
+  await assert.rejects(() => running.qf.workflows.retry("wf-1"), (err) => {
+    assert.ok(err instanceof ConflictError);
+    assert.equal(err.message, "workflow is running");
+    return true;
+  });
+
+  // A retry is a state change: a 503 must not be re-sent.
+  const flaky = clientWith([jsonResponse({ error: "down" }, 503), new Response(null, { status: 204 })]);
+  await assert.rejects(() => flaky.qf.workflows.retry("wf-1"), ApiError);
+  assert.equal(flaky.calls.length, 1);
+});
+
+test("workflows.steps returns the 0.6.0 step-state fields with parsed dates", async () => {
+  const { qf } = clientWith([
+    jsonResponse({
+      steps: [
+        {
+          name: "gate",
+          status: "skipped",
+          error: "condition not met",
+          started_at: "2026-01-01T00:00:01Z",
+          completed_at: "2026-01-01T00:00:01Z",
+        },
+        {
+          name: "resize",
+          status: "running",
+          job_id: "job-9",
+          started_at: "2026-01-01T00:00:02Z",
+          fan_out: { total: 3, completed: 1, failed: 0 },
+        },
+        { name: "fulfil", status: "running", child_workflow_id: "wf-child", started_at: "2026-01-01T00:00:03Z" },
+        { name: "later", status: "pending" },
+      ],
+    }),
+  ]);
+  const steps = await qf.workflows.steps("wf-1");
+  assert.equal(steps.length, 4);
+  assert.equal(steps[0].error, "condition not met");
+  assert.ok(steps[0].completed_at instanceof Date);
+  assert.deepEqual(steps[1].fan_out, { total: 3, completed: 1, failed: 0 });
+  assert.equal(steps[1].job_id, "job-9");
+  assert.equal(steps[2].child_workflow_id, "wf-child");
+  assert.ok(steps[2].started_at instanceof Date);
+  assert.equal(steps[3].started_at, undefined);
+  assert.equal(steps[3].fan_out, undefined);
+});
+
+test("workflows.watch yields decoded status events and stops at the terminal one", async () => {
+  const ev = (status, steps, extra = {}) =>
+    `event: status\ndata: ${JSON.stringify({ workflow_id: "wf-1", status, steps, ...extra })}\n\n`;
+  const stream =
+    `: keep-alive\n\n` +
+    ev("running", [{ name: "a", status: "running", job_id: "j1", started_at: "2026-01-01T00:00:00Z" }]) +
+    `event: ping\ndata: {}\n\n` +
+    ev("running", [{ name: "a", status: "completed", job_id: "j1" }, { name: "b", status: "running", fan_out: { total: 2, completed: 0, failed: 0 } }]) +
+    ev("failed", [{ name: "a", status: "completed" }, { name: "b", status: "failed", error: "1 of 2 items failed" }], { error_message: "step b failed" }) +
+    // Anything after the terminal event is never read.
+    ev("running", []);
+  const { qf, calls } = clientWith([
+    () => new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } }),
+  ]);
+
+  const seen = [];
+  for await (const event of qf.workflows.watch("wf/1")) seen.push(event);
+
+  assert.ok(calls[0].url.endsWith("/api/v1/workflows/wf%2F1/events"), calls[0].url);
+  assert.equal(calls[0].headers.accept, "text/event-stream");
+  assert.equal(calls[0].headers.authorization, "Bearer test-token");
+  assert.deepEqual(seen.map((e) => e.status), ["running", "running", "failed"]);
+  assert.ok(seen[0].steps[0].started_at instanceof Date);
+  assert.deepEqual(seen[1].steps[1].fan_out, { total: 2, completed: 0, failed: 0 });
+  assert.equal(seen[2].error_message, "step b failed");
+  assert.equal(seen[2].steps[1].error, "1 of 2 items failed");
+});
+
+test("workflows.watch maps a non-2xx response to a typed error", async () => {
+  const { qf } = clientWith([jsonResponse({ error: "workflow not found" }, 404)]);
+  await assert.rejects(async () => {
+    for await (const _ of qf.workflows.watch("missing")) void _;
+  }, NotFoundError);
 });

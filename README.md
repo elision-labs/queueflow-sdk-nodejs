@@ -73,7 +73,9 @@ await qf.ready();     // GET /ready
 
 Methods marked **0.5.0** below call endpoints added in QueueFlow server 0.5.0 (bulk cancel,
 bulk replay, queue pause/resume, `whoami`, and the `taskName` / `replayed` list filters); an
-older server answers them with a 404.
+older server answers them with a 404. Methods and fields marked **0.6.0** need server 0.6.0
+(workflow retry and events, and the `queue`, `when`, `fan_out`, `workflow` and `timeout_secs`
+workflow fields); an older server rejects the new request fields with a 400.
 
 ### Jobs — `qf.jobs`
 
@@ -112,9 +114,63 @@ while ((await qf.jobs.cancelMany({ queue: "billing", status: "pending", limit: 5
 | --- | --- |
 | `create(builderOrBody)` | Create a workflow from a `wf()` builder or a raw request. |
 | `get(id)` · `list(opts?)` · `cancel(id)` | Fetch / list / cancel. |
+| `retry(id)` | **0.6.0** Re-run a `failed`, `partially_failed` or `cancelled` workflow from where it stopped. |
 | `diagram(id)` | Mermaid (`graph TD`) diagram of the DAG. |
-| `steps(id)` | Runtime state of every step (name, status, job id). |
+| `steps(id)` | Runtime state of every step, in declaration order (see below). |
 | `waitFor(id, opts?)` | Poll until a terminal workflow state. |
+| `watch(id, opts?)` | **0.6.0** Async-iterate `WorkflowEvent`s (SSE); ends after the terminal one. |
+
+The `Workflow` record carries, since **0.6.0**, `error_message` (why it ended `failed` or
+`cancelled`), `timeout_secs` and `deadline_at` (the whole-workflow budget and when it runs out),
+`retry_count`, and `parent_workflow_id` / `parent_step_name` on a child spawned by a
+sub-workflow step.
+
+#### Step state — `steps(id)`
+
+Each entry is `{ name, status, job_id?, error?, started_at?, completed_at?, child_workflow_id?,
+fan_out? }`. `status` is `pending`, `running`, `completed`, `failed`, `cancelled` or `skipped`;
+`job_id` is the job executing the step (the first child, for a fan-out). The rest are **0.6.0**:
+
+| Field | Meaning |
+| --- | --- |
+| `error` | Why the step failed, was skipped (`condition not met` for a false `when`) or was cancelled. |
+| `started_at` · `completed_at` | `Date`s: when the step was scheduled and when it reached a terminal status. |
+| `child_workflow_id` | The child workflow of a sub-workflow step, once spawned. Pass it to `get()` / `steps()`. |
+| `fan_out` | `{ total, completed, failed }` progress of a fan-out step's children. |
+
+#### Retry — `retry(id)` (**0.6.0**)
+
+Every step that did not complete (failed, cancelled, or skipped by a failure policy) goes back to
+`pending` and is scheduled again as its dependencies allow; completed steps and
+condition-skipped steps keep their results and do not run again. The workflow becomes `running`,
+its `error_message` clears, `retry_count` increments, and the deadline, if any, is re-armed from
+the original `timeout_secs`. Retrying a running or completed workflow throws `ConflictError`
+(409). Fix the cause first: a retry with the same inputs fails the same way.
+
+```ts
+const failed = await qf.workflows.waitFor(id);
+if (failed.status === "failed") {
+  console.error(failed.error_message);
+  await qf.workflows.retry(id);
+  const second = await qf.workflows.waitFor(id); // second.retry_count === 1
+}
+```
+
+#### Events — `watch(id)` (**0.6.0**)
+
+Streams `GET /api/v1/workflows/{id}/events` over Server-Sent Events, in the same style as
+`qf.jobs.watch()`. Each event is a `WorkflowEvent`: `{ workflow_id, status, error_message?,
+steps }`, where `steps` is the same array `steps(id)` returns. The first event is the current
+state, one follows whenever the workflow or any step changes, and the iterator ends after the
+terminal event (the server also closes the stream after 15 minutes; reconnect to keep following).
+Pass `{ signal }` to stop early.
+
+```ts
+for await (const event of qf.workflows.watch(id)) {
+  const running = event.steps.filter((s) => s.status === "running").map((s) => s.name);
+  console.log(event.status, running.join(", "));
+}
+```
 
 ### Workflow builder — `wf()`
 
@@ -128,6 +184,68 @@ const dag = wf("order_123")
   .context({ source: "web" });
 // .build() runs locally first: duplicate names, dangling deps, and cycles throw early.
 ```
+
+`step(name, task, options?)` takes `{ after?, payload?, config?, onFailure?, onSuccess?,
+metadata?, queue?, when?, fanOut? }`. The builder produces the server's `CreateWorkflowRequest`
+(`build()`), and `qf.workflows.create()` accepts the builder directly.
+
+#### Queues, conditions, fan-out, sub-workflows, timeouts (**0.6.0**)
+
+| Addition | Meaning |
+| --- | --- |
+| `queue` | Queue for the step's job(s); the server's default queue when absent. Run your own `qf.worker.run(queue, …)` against it. |
+| `when` | A `Condition` over the context, evaluated when the step becomes ready. False skips the step (`condition not met`); its dependents still run, without a result for it. |
+| `fanOut: { path, itemKey?, maxItems? }` | Run the task once per element of the array at `path` in the context. Each child gets the element under `itemKey` (default `item`) and its position under `_index`; the step's result is `{ results: [...] }` in element order. |
+| `.subWorkflow(name, child, options?)` | A step that runs an inline child workflow (another `wf()` builder or a raw body) instead of a task. `options` is `StepOptions` without `fanOut`. |
+| `.timeout(secs)` | Whole-workflow budget. When it runs out every unfinished step is cancelled and the workflow fails with `workflow timed out after Ns`; a retry re-arms it. |
+
+A `Condition` is a leaf `{ path, op?, value? }` or a branch `{ all: [...] }`, `{ any: [...] }`,
+`{ not: {...} }`. `path` is dotted (`validate.ok` is the `ok` key of the `validate` step's result;
+numeric segments index arrays). `op` is one of `eq` (default with a `value`), `ne`, `gt`, `gte`,
+`lt`, `lte`, `exists` (default without a `value`), `contains`, `in`. A missing path never errors;
+it compares as absent.
+
+```ts
+const fulfilment = wf("fulfilment")
+  .step("pick", "pick_items", { queue: "warehouse" })
+  .step("pack", "pack_parcel", { queue: "warehouse", after: ["pick"] })
+  .timeout(1800);
+
+const order = wf("order_123")
+  .context({ source: "web" })
+  .step("validate", "validate_order", { queue: "orders", payload: { order_id: 123 } })
+  .step("fraud", "fraud_check", { queue: "orders", after: ["validate"] })
+  .step("review", "queue_for_review", {
+    queue: "orders",
+    after: ["fraud"],
+    when: { any: [
+      { path: "fraud.score", op: "gt", value: 0.8 },
+      { all: [{ path: "validate.total_cents", op: "gte", value: 100000 },
+              { not: { path: "customer.trusted", value: true } }] },
+    ] },
+  })
+  .step("resize", "resize_image", {
+    queue: "images",
+    after: ["validate"],
+    fanOut: { path: "validate.images", itemKey: "image" },
+    onFailure: "continue",
+  })
+  .subWorkflow("fulfil", fulfilment, { after: ["fraud", "review"], payload: { warehouse: "eu-1" } })
+  .timeout(3600);
+
+const run = await qf.workflows.create(order);
+```
+
+Inside a handler, a fan-out child reads `job.payload.image` and `job.payload._index`; a
+sub-workflow's steps read the parent's results under `job.payload._context._parent.<step>`
+and the step payload at `job.payload._context.warehouse`. Downstream of `fulfil`, the child's
+final context is `_context.fulfil`, so `_context.fulfil.pack` is the `pack` step's result.
+
+`build()` also rejects, before any network call: a step with neither a task nor a sub-workflow,
+a fan-out on a sub-workflow step, a `fanOut` without a `path`, a malformed `when` (a leaf needs a
+`path`; `op`s other than `exists` need a `value`; a branch holds exactly one of `all` / `any` /
+`not`), and a `timeout` that is not a whole number of seconds between 1 and 30 days. Errors
+name the step, as the server's do.
 
 ### System — `qf.system`
 
@@ -266,10 +384,12 @@ docs, hitting the engine directly, teardown, and troubleshooting.
 `test/live.mjs` runs the facade against a real QueueFlow server (started with the default
 `queueflow serve`, i.e. `--mode all`, so the built-in `echo` handler is registered). It creates
 and waits on an `echo` job, checks idempotent re-creation, runs a two-step workflow, exercises the
-cron and dead-letter endpoints, reads stats, runs `qf.worker.run()` against a dedicated queue, and
+cron and dead-letter endpoints, reads stats, runs `qf.worker.run()` against a dedicated queue,
 (against server 0.5.0) checks `whoami`, bulk cancel, queue pause/resume, and bulk dead-letter
-replay. Every bulk operation is scoped to a queue name unique to the run, so the suite is safe to
-point at a shared development server. It is skipped unless `QUEUEFLOW_URL` is set, so `npm test`
+replay, and (against server 0.6.0) runs a conditional step that is skipped, a fan-out, a
+sub-workflow, a failed-then-retried workflow and the `watch()` event stream, each on its own
+queue with its own worker. Every bulk operation and every 0.6.0 workflow is scoped to a queue
+name unique to the run, so the suite is safe to point at a shared development server. It is skipped unless `QUEUEFLOW_URL` is set, so `npm test`
 and CI stay offline.
 
 ```bash
@@ -292,8 +412,8 @@ queueflow-sdk-nodejs/
 ├── core/        generated from the OpenAPI spec (models, per-tag API clients, fetch runtime).
 │                Never hand-edited; regenerated with `npm run generate-core`.
 └── src/         the hand-written facade (this package's public API)
-    ├── client.ts    QueueFlow + jobs/workflows/worker/system, retries, SSE watch()
-    ├── workflow.ts  the wf() builder with local DAG validation
+    ├── client.ts    QueueFlow + jobs/workflows/worker/system, retries, SSE watch() streams
+    ├── workflow.ts  the wf() builder with local DAG and step-shape validation
     ├── errors.ts    typed error hierarchy, mapped from the core's runtime errors
     └── json.ts      JSON input types
 ```

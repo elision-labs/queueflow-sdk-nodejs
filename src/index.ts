@@ -35,7 +35,12 @@ export type {
 } from "./client";
 
 export { wf, WorkflowBuilder, WorkflowValidationError } from "./workflow";
-export type { StepOptions } from "./workflow";
+export type {
+  StepOptions,
+  SubWorkflowStepOptions,
+  Condition,
+  FanOutOptions,
+} from "./workflow";
 
 export {
   QueueFlowError,
@@ -63,6 +68,13 @@ export type {
   Workflow,
   WorkflowStep,
   WorkflowStatus,
+  StepStatus,
+  StepCondition,
+  ConditionOp,
+  FanOut,
+  FanOutProgress,
+  WorkflowEvent,
+  CreateWorkflowRequest,
   OnFailure,
   OnSuccess,
   LeasedJob,

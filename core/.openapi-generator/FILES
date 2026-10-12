@@ -16,6 +16,7 @@ src/models/BackoffStrategy.ts
 src/models/CancelJobsRequest.ts
 src/models/CancelJobsResponse.ts
 src/models/CompleteJobRequest.ts
+src/models/ConditionOp.ts
 src/models/CreateBatchJobsRequest.ts
 src/models/CreateBatchJobsResponse.ts
 src/models/CreateCronRequest.ts
@@ -28,6 +29,8 @@ src/models/CronSchedule.ts
 src/models/DeadLetter.ts
 src/models/ErrorBody.ts
 src/models/FailJobRequest.ts
+src/models/FanOut.ts
+src/models/FanOutProgress.ts
 src/models/HealthStatus.ts
 src/models/HeartbeatRequest.ts
 src/models/HeartbeatResponse.ts
@@ -53,11 +56,13 @@ src/models/ReplayDeadLettersRequest.ts
 src/models/ReplayDeadLettersResponse.ts
 src/models/ReplayedDeadLetter.ts
 src/models/StatsSnapshot.ts
+src/models/StepCondition.ts
 src/models/StepStatus.ts
 src/models/TasksResponse.ts
 src/models/WhoAmIResponse.ts
 src/models/Workflow.ts
 src/models/WorkflowDiagramResponse.ts
+src/models/WorkflowEvent.ts
 src/models/WorkflowStatus.ts
 src/models/WorkflowStep.ts
 src/models/WorkflowStepState.ts
